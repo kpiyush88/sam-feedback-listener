@@ -1,0 +1,95 @@
+###############################################
+# Environment / Secrets
+###############################################
+.env
+.env.*
+*.env
+secrets.*
+
+###############################################
+# Python Artifacts
+###############################################
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environments
+venv/
+.venv/
+ENV/
+env/
+
+# Packaging / Build
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+*.egg-info/
+*.egg
+sdist/
+lib/
+lib64/
+parts/
+var/
+.installed.cfg
+
+# Type Checker / Analysis Caches
+.mypy_cache/
+.pytest_cache/
+pytest_cache/
+.hypothesis/
+.pyre/
+cython_debug/
+
+###############################################
+# Test & Coverage Reports
+###############################################
+.coverage
+.coverage.*
+nosetests.xml
+coverage.xml
+*.cover
+
+###############################################
+# Message & Large JSON Data
+###############################################
+# Ignore all messages content except optional keep file
+messages/*
+!messages/.keep
+
+# If you want to track a small curated sample add a folder and negate it, e.g.:
+# !messages/sample/**
+
+# Bulk JSON data
+*.json
+
+###############################################
+# Editors / IDE
+###############################################
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+###############################################
+# OS Files
+###############################################
+.DS_Store
+Thumbs.db
+
+###############################################
+# Logs
+###############################################
+*.log
+logs/
+
+###############################################
+# Misc
+###############################################
+*.db
+*.sqlite*
+*.bak
