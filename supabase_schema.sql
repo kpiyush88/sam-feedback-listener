@@ -2,9 +2,7 @@
 
 -- Conversations table (top-level grouping by contextId/session)
 CREATE TABLE IF NOT EXISTS conversations (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    context_id TEXT UNIQUE NOT NULL,
-    session_id TEXT,
+    context_id TEXT PRIMARY KEY NOT NULL,
     started_at TIMESTAMPTZ NOT NULL,
     ended_at TIMESTAMPTZ,
     total_messages INTEGER DEFAULT 0,
@@ -15,8 +13,12 @@ CREATE TABLE IF NOT EXISTS conversations (
     user_email TEXT,
     user_name TEXT,
     user_country TEXT,
-    user_job_grade TEXT,
-    metadata JSONB,
+    user_id TEXT,
+    user_company TEXT,
+    user_location TEXT,
+    user_language TEXT,
+    user_authenticated BOOLEAN,
+    metadata JSONB,  -- Contains user_profile with job_grade, job_title, department, etc.
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -76,71 +78,6 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Context retrieval table (tracks what context was retrieved for RAG)
-CREATE TABLE IF NOT EXISTS context_retrievals (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    message_id UUID REFERENCES messages(id) ON DELETE CASCADE,
-    task_id UUID REFERENCES tasks(id) ON DELETE CASCADE,
-    query TEXT,
-    retrieved_documents JSONB,
-    num_documents INTEGER,
-    retrieval_method TEXT,
-    filters_applied JSONB,
-    timestamp TIMESTAMPTZ NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Evaluations table (stores evaluation results)
-CREATE TABLE IF NOT EXISTS evaluations (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    conversation_id UUID REFERENCES conversations(id) ON DELETE CASCADE,
-    task_id UUID REFERENCES tasks(id) ON DELETE CASCADE,
-    message_id UUID REFERENCES messages(id) ON DELETE CASCADE,
-    evaluation_type TEXT NOT NULL, -- 'groundedness', 'context_relevance', 'answer_relevance', 'verbosity', 'toxicity', etc.
-    score NUMERIC,
-    passed BOOLEAN,
-    details JSONB,
-    evaluated_at TIMESTAMPTZ DEFAULT NOW(),
-    evaluator TEXT, -- 'llm', 'rule-based', 'human'
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Performance metrics table
-CREATE TABLE IF NOT EXISTS performance_metrics (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    task_id UUID REFERENCES tasks(id) ON DELETE CASCADE,
-    metric_type TEXT NOT NULL, -- 'latency', 'token_usage', 'cost', etc.
-    metric_value NUMERIC,
-    unit TEXT, -- 'seconds', 'tokens', 'usd', etc.
-    timestamp TIMESTAMPTZ NOT NULL,
-    metadata JSONB,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Human feedback table
-CREATE TABLE IF NOT EXISTS human_feedback (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    conversation_id UUID REFERENCES conversations(id) ON DELETE CASCADE,
-    message_id UUID REFERENCES messages(id) ON DELETE CASCADE,
-    feedback_type TEXT, -- 'thumbs_up', 'thumbs_down', 'rating', 'comment'
-    rating INTEGER, -- 1-5 scale
-    comment TEXT,
-    user_id TEXT,
-    timestamp TIMESTAMPTZ DEFAULT NOW(),
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Topic clusters table (for conversation topic modeling)
-CREATE TABLE IF NOT EXISTS topic_clusters (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    conversation_id UUID REFERENCES conversations(id) ON DELETE CASCADE,
-    cluster_id TEXT,
-    topic_label TEXT,
-    keywords TEXT[],
-    confidence NUMERIC,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
 -- Create indexes for better query performance
 CREATE INDEX IF NOT EXISTS idx_conversations_context_id ON conversations(context_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_started_at ON conversations(started_at);
@@ -151,9 +88,14 @@ CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation
 CREATE INDEX IF NOT EXISTS idx_messages_task_id ON messages(task_id);
 CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_task_id ON tool_calls(task_id);
-CREATE INDEX IF NOT EXISTS idx_evaluations_conversation_id ON evaluations(conversation_id);
-CREATE INDEX IF NOT EXISTS idx_evaluations_evaluation_type ON evaluations(evaluation_type);
-CREATE INDEX IF NOT EXISTS idx_human_feedback_conversation_id ON human_feedback(conversation_id);
+
+-- JSONB/JSON indexes for metadata columns using GIN (Generalized Inverted Index)
+-- These allow fast queries on JSONB fields using operators like @>, ?, ?&, ?|
+CREATE INDEX IF NOT EXISTS idx_conversations_metadata_gin ON conversations USING GIN (metadata);
+CREATE INDEX IF NOT EXISTS idx_tasks_metadata_gin ON tasks USING GIN (metadata);
+CREATE INDEX IF NOT EXISTS idx_messages_metadata_gin ON messages USING GIN (metadata);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_parameters_gin ON tool_calls USING GIN (parameters);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_result_gin ON tool_calls USING GIN (result);
 
 -- Create updated_at trigger function
 CREATE OR REPLACE FUNCTION update_updated_at_column()

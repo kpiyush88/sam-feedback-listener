@@ -106,6 +106,9 @@ class ParsedMessage:
     # Tool/function calls
     tool_calls: List[Dict] = field(default_factory=list)
 
+    # Tool results
+    tool_results: List[Dict] = field(default_factory=list)
+
     # User profile
     user_profile: Optional[UserProfile] = None
 
@@ -141,6 +144,63 @@ class ParamsParser(PayloadParser):
     def can_parse(self, payload: Dict) -> bool:
         return 'params' in payload
 
+    @staticmethod
+    def _aggregate_token_usage(parts: List[Dict]) -> Optional[TokenUsage]:
+        """Aggregate token usage from all llm_response parts"""
+        total_input = 0
+        total_output = 0
+        total_cached = 0
+        total_tokens = 0
+        by_model = {}
+
+        for part in parts:
+            if part.get('kind') == 'data':
+                data = part.get('data', {})
+                if data.get('type') == 'llm_response':
+                    # Extract from usage_metadata (inside data.data)
+                    response_data = data.get('data', {})
+                    usage_meta = response_data.get('usage_metadata', {})
+
+                    prompt_tokens = usage_meta.get('prompt_token_count', 0)
+                    candidates_tokens = usage_meta.get('candidates_token_count', 0)
+
+                    # Extract from usage field (inside data)
+                    usage = data.get('usage', {})
+                    input_tokens = usage.get('input_tokens', 0)
+                    output_tokens = usage.get('output_tokens', 0)
+                    cached_tokens = usage.get('cached_tokens', 0)
+
+                    # Prefer usage over usage_metadata if both exist
+                    if input_tokens > 0 or output_tokens > 0:
+                        total_input += input_tokens
+                        total_output += output_tokens
+                        total_cached += cached_tokens
+                    else:
+                        # Fallback to usage_metadata
+                        total_input += prompt_tokens
+                        total_output += candidates_tokens
+
+                    # Track by model
+                    model = usage.get('model')
+                    if model:
+                        if model not in by_model:
+                            by_model[model] = {'input': 0, 'output': 0}
+                        by_model[model]['input'] += (input_tokens or prompt_tokens)
+                        by_model[model]['output'] += (output_tokens or candidates_tokens)
+
+        # Calculate total
+        total_tokens = total_input + total_output
+
+        if total_input > 0 or total_output > 0:
+            return TokenUsage(
+                total_tokens=total_tokens,
+                input_tokens=total_input,
+                output_tokens=total_output,
+                cached_tokens=total_cached,
+                by_model=by_model
+            )
+        return None
+
     def parse(self, payload: Dict, parsed: ParsedMessage) -> None:
         params = payload['params']
         message = params.get('message', {})
@@ -170,11 +230,22 @@ class ParamsParser(PayloadParser):
         parsed.parent_task_id = msg_metadata.get('parentTaskId')
         parsed.function_call_id = msg_metadata.get('function_call_id')
 
-        # Extract tool calls from parts
+        # Extract tool calls from parts (both llm_invocation and tool_invocation_start)
         parsed.tool_calls = [
             p.get('data', {}) for p in parts
-            if p.get('kind') == 'data' and p.get('data', {}).get('type') == 'llm_invocation'
+            if p.get('kind') == 'data' and p.get('data', {}).get('type') in ('llm_invocation', 'tool_invocation_start')
         ]
+
+        # Extract tool results from parts
+        parsed.tool_results = [
+            p.get('data', {}) for p in parts
+            if p.get('kind') == 'data' and p.get('data', {}).get('type') == 'tool_result'
+        ]
+
+        # Aggregate token usage from all llm_response parts
+        token_usage = ParamsParser._aggregate_token_usage(parts)
+        if token_usage:
+            parsed.token_usage = token_usage
 
         # Parse user profile if present (in system instructions)
         UserProfileExtractor.extract(parts, parsed)
@@ -220,11 +291,22 @@ class StatusUpdateParser:
             parts = status_message.get('parts', [])
             parsed.message_parts = parts
 
-            # Extract tool calls from status update
+            # Extract tool calls from status update (both llm_invocation and tool_invocation_start)
             parsed.tool_calls = [
                 p.get('data', {}) for p in parts
-                if p.get('kind') == 'data' and p.get('data', {}).get('type') == 'llm_invocation'
+                if p.get('kind') == 'data' and p.get('data', {}).get('type') in ('llm_invocation', 'tool_invocation_start')
             ]
+
+            # Extract tool results from status update
+            parsed.tool_results = [
+                p.get('data', {}) for p in parts
+                if p.get('kind') == 'data' and p.get('data', {}).get('type') == 'tool_result'
+            ]
+
+            # Aggregate token usage from status update message parts
+            token_usage = ParamsParser._aggregate_token_usage(parts)
+            if token_usage:
+                parsed.token_usage = token_usage
 
 
 class TaskResultParser:

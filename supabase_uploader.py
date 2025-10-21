@@ -11,37 +11,38 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime
 from pathlib import Path
 from abc import ABC, abstractmethod
-from supabase import create_client, Client
+try:
+    from supabase import create_client, Client  # type: ignore
+except ImportError:  # Allow tests to run without supabase installed
+    class Client:  # type: ignore
+        pass
+    def create_client(url: str, key: str):  # type: ignore
+        raise ImportError("supabase package not installed. Install with 'pip install supabase'.")
 from message_parser import MessageParser, ParsedMessage, MessageRole, TaskStatus
 
 
 class DatabaseCache:
-    """Manages caching of database IDs to avoid duplicate lookups"""
+    """Simple existence cache for text keys"""
 
     def __init__(self):
-        self._conversation_cache: Dict[str, str] = {}  # context_id -> context_id
-        self._task_cache: Dict[str, str] = {}  # task_id -> task_id
+        self._conversations: set[str] = set()
+        self._tasks: set[str] = set()
 
-    def get_conversation(self, context_id: str) -> Optional[str]:
-        """Get conversation ID from cache"""
-        return self._conversation_cache.get(context_id)
+    def has_conversation(self, context_id: str) -> bool:
+        return context_id in self._conversations
 
     def cache_conversation(self, context_id: str) -> None:
-        """Add conversation ID to cache"""
-        self._conversation_cache[context_id] = context_id
+        self._conversations.add(context_id)
 
-    def get_task(self, task_id: str) -> Optional[str]:
-        """Get task ID from cache"""
-        return self._task_cache.get(task_id)
+    def has_task(self, task_id: str) -> bool:
+        return task_id in self._tasks
 
     def cache_task(self, task_id: str) -> None:
-        """Add task ID to cache"""
-        self._task_cache[task_id] = task_id
+        self._tasks.add(task_id)
 
     def clear(self) -> None:
-        """Clear all cached data"""
-        self._conversation_cache.clear()
-        self._task_cache.clear()
+        self._conversations.clear()
+        self._tasks.clear()
 
 
 class MessageTypeDetector:
@@ -130,7 +131,27 @@ class DataMapper:
 
     @staticmethod
     def extract_per_message_token_usage(parsed: ParsedMessage) -> Optional[Dict]:
-        """Extract token usage from individual message parts (llm_response)"""
+        """
+        Extract token usage from ParsedMessage.
+        Priority 1: Use aggregated token_usage from ParsedMessage (best source)
+        Priority 2: Extract from message parts (fallback)
+        """
+        # Priority 1: Use aggregated token_usage from ParsedMessage
+        if parsed.token_usage and (parsed.token_usage.input_tokens > 0 or
+                                     parsed.token_usage.output_tokens > 0):
+            # Get the first model name if available
+            model = None
+            if parsed.token_usage.by_model:
+                model = list(parsed.token_usage.by_model.keys())[0]
+
+            return {
+                'model': model,
+                'input_tokens': parsed.token_usage.input_tokens,
+                'output_tokens': parsed.token_usage.output_tokens,
+                'total_tokens': parsed.token_usage.total_tokens,
+            }
+
+        # Priority 2: Extract from message parts (fallback for older parsing)
         if not parsed.message_parts:
             return None
 
@@ -144,13 +165,16 @@ class DataMapper:
                     usage = data.get('usage', {})
 
                     if usage_metadata or usage:
+                        # Prefer usage over usage_metadata
+                        input_tokens = usage.get('input_tokens') or usage_metadata.get('prompt_token_count', 0)
+                        output_tokens = usage.get('output_tokens') or usage_metadata.get('candidates_token_count', 0)
+                        total_tokens = input_tokens + output_tokens if (input_tokens or output_tokens) else usage_metadata.get('total_token_count', 0)
+
                         return {
                             'model': usage.get('model'),
-                            'prompt_tokens': usage_metadata.get('prompt_token_count', 0),
-                            'candidates_tokens': usage_metadata.get('candidates_token_count', 0),
-                            'total_tokens': usage_metadata.get('total_token_count', 0),
-                            'input_tokens': usage.get('input_tokens', 0),
-                            'output_tokens': usage.get('output_tokens', 0)
+                            'input_tokens': input_tokens,
+                            'output_tokens': output_tokens,
+                            'total_tokens': total_tokens,
                         }
 
         return None
@@ -200,110 +224,97 @@ class DataMapper:
 
     @staticmethod
     def to_conversation(parsed: ParsedMessage) -> Dict[str, Any]:
-        """Map ParsedMessage to conversation data"""
-        conv_data = {
+        data: Dict[str, Any] = {
             'context_id': parsed.context_id,
             'started_at': parsed.timestamp.isoformat(),
             'metadata': {}
         }
-
-        # Add user profile if available
         if parsed.user_profile:
-            # Core user fields in dedicated columns
-            conv_data['user_id'] = parsed.user_profile.id
-            conv_data['user_email'] = parsed.user_profile.email
-            conv_data['user_name'] = parsed.user_profile.name
-            conv_data['user_country'] = parsed.user_profile.country
-            conv_data['user_job_grade'] = parsed.user_profile.job_grade
-            conv_data['user_company'] = parsed.user_profile.company
-            conv_data['user_manager_id'] = parsed.user_profile.manager_id
-            conv_data['user_location'] = parsed.user_profile.location
-            conv_data['user_language'] = parsed.user_profile.language
-            conv_data['user_authenticated'] = parsed.user_profile.authenticated
-
-            # Extended user fields in metadata
-            conv_data['metadata'] = {
-                'user_profile': {
-                    'job_title': parsed.user_profile.job_title,
-                    'department': parsed.user_profile.department,
-                    'employee_group': parsed.user_profile.employee_group,
-                    'fte': parsed.user_profile.fte,
-                    'manager_name': parsed.user_profile.manager_name,
-                    'division': parsed.user_profile.division,
-                    'job_family': parsed.user_profile.job_family,
-                    'job_sub_family': parsed.user_profile.job_sub_family,
-                    'cost_center': parsed.user_profile.cost_center,
-                    'business_unit': parsed.user_profile.business_unit,
-                    'contract_type': parsed.user_profile.contract_type,
-                    'position_grade': parsed.user_profile.position_grade,
-                    'salary_structure': parsed.user_profile.salary_structure,
-                    'security_code': parsed.user_profile.security_code,
-                    'auth_method': parsed.user_profile.auth_method
-                }
+            data['user_email'] = parsed.user_profile.email
+            data['user_name'] = parsed.user_profile.name
+            data['user_country'] = parsed.user_profile.country
+            data['user_id'] = parsed.user_profile.id
+            data['user_company'] = parsed.user_profile.company
+            data['user_location'] = parsed.user_profile.location
+            data['user_language'] = parsed.user_profile.language
+            data['user_authenticated'] = parsed.user_profile.authenticated
+            data['metadata']['user_profile'] = {
+                'job_title': parsed.user_profile.job_title,
+                'job_grade': parsed.user_profile.job_grade,
+                'department': parsed.user_profile.department,
+                'employee_group': parsed.user_profile.employee_group,
+                'fte': parsed.user_profile.fte,
+                'manager_name': parsed.user_profile.manager_name,
+                'division': parsed.user_profile.division,
+                'job_family': parsed.user_profile.job_family,
+                'job_sub_family': parsed.user_profile.job_sub_family,
+                'cost_center': parsed.user_profile.cost_center,
+                'business_unit': parsed.user_profile.business_unit,
+                'contract_type': parsed.user_profile.contract_type,
+                'position_grade': parsed.user_profile.position_grade,
+                'salary_structure': parsed.user_profile.salary_structure,
+                'security_code': parsed.user_profile.security_code,
+                'auth_method': parsed.user_profile.auth_method
             }
-
-        return conv_data
+        return data
 
     @staticmethod
-    def to_task(parsed: ParsedMessage, context_id: str) -> Dict[str, Any]:
-        """Map ParsedMessage to task data"""
+    def to_task(parsed: ParsedMessage, context_id: str, interaction_id: Optional[str] = None) -> Dict[str, Any]:
         task_type = 'subtask' if parsed.parent_task_id else 'main'
-
-        task_data = {
-            'context_id': context_id,
+        is_final = DataMapper.extract_is_final(parsed)
+        result_id = DataMapper.extract_result_id(parsed)
+        return {
             'task_id': parsed.id,
+            'context_id': context_id,
             'parent_task_id': parsed.parent_task_id,
+            'interaction_id': interaction_id,
             'agent_name': parsed.agent_name,
             'task_type': task_type,
             'status': parsed.task_status.value if parsed.task_status else 'working',
             'started_at': parsed.timestamp.isoformat(),
+            'is_final': bool(is_final),
+            'result_id': result_id,
             'metadata': {
                 'topic': parsed.topic,
-                'method': parsed.method,
-                'is_final': DataMapper.extract_is_final(parsed),
-                'result_id': DataMapper.extract_result_id(parsed)
+                'method': parsed.method
             }
         }
 
-        return task_data
-
     @staticmethod
-    def to_message(parsed: ParsedMessage, context_id: str, task_id: str) -> Dict[str, Any]:
-        """Map ParsedMessage to message data"""
-        # Extract per-message token usage
+    def to_message(parsed: ParsedMessage, context_id: str, task_id: str, interaction_id: Optional[str] = None) -> Dict[str, Any]:
         token_usage = DataMapper.extract_per_message_token_usage(parsed)
-
-        message_data = {
+        message_kind = DataMapper.extract_message_kind(parsed)
+        is_partial = DataMapper.extract_is_partial(parsed)
+        input_tokens = token_usage.get('input_tokens') if token_usage else None
+        output_tokens = token_usage.get('output_tokens') if token_usage else None
+        total_tokens = token_usage.get('total_tokens') if token_usage else None
+        model_used = token_usage.get('model') if token_usage else None
+        return {
+            'message_id': parsed.message_id,
             'context_id': context_id,
             'task_id': task_id,
-            'message_id': parsed.message_id,
+            'interaction_id': interaction_id,
             'role': parsed.role.value if parsed.role else 'system',
-            'message_type': MessageTypeDetector.detect(parsed),  # Semantic message type
+            'message_type': MessageTypeDetector.detect(parsed),
             'agent_name': parsed.agent_name,
-            'content': DataMapper.extract_content_summary(parsed),  # Extract or generate content
-            'parts': parsed.message_parts,  # FULL parts data, no sanitization
+            'content': DataMapper.extract_content_summary(parsed),
+            'parts': parsed.message_parts,
             'timestamp': parsed.timestamp.isoformat(),
             'topic': parsed.topic,
-            'correlation_id': DataMapper.extract_correlation_id(parsed),  # Extract from topic
+            'correlation_id': DataMapper.extract_correlation_id(parsed),
+            'message_kind': message_kind,
+            'is_partial': is_partial,
+            'model_used': model_used,
+            'input_tokens': input_tokens,
+            'output_tokens': output_tokens,
+            'total_tokens': total_tokens,
             'metadata': {
                 'agent_id': parsed.agent_id,
                 'message_number': parsed.message_number,
                 'function_call_id': parsed.function_call_id,
-                'method': parsed.method,  # Keep original JSON-RPC method for reference
-                'message_kind': DataMapper.extract_message_kind(parsed),
-                'is_partial': DataMapper.extract_is_partial(parsed),
-                'token_usage': token_usage  # Per-message token usage if available
+                'method': parsed.method
             }
         }
-
-        # Add per-message token fields if available
-        if token_usage:
-            message_data['metadata']['model_used'] = token_usage.get('model')
-            message_data['metadata']['input_tokens'] = token_usage.get('input_tokens')
-            message_data['metadata']['output_tokens'] = token_usage.get('output_tokens')
-            message_data['metadata']['total_tokens'] = token_usage.get('total_tokens')
-
-        return message_data
 
     @staticmethod
     def to_task_update(parsed: ParsedMessage) -> Dict[str, Any]:
@@ -334,35 +345,53 @@ class DataMapper:
 
 
 class ConversationManager:
-    """Manages conversation records in Supabase"""
+    """Manages conversations via TEXT context_id"""
 
     def __init__(self, client: Client, cache: DatabaseCache):
         self.client = client
         self.cache = cache
 
     def ensure_exists(self, parsed: ParsedMessage) -> str:
-        """Ensure conversation exists in database, return context_id"""
         context_id = parsed.context_id
-
-        # Check cache
-        if self.cache.get_conversation(context_id):
+        if not context_id:
+            raise ValueError("Missing context_id")
+        if self.cache.has_conversation(context_id):
             return context_id
-
-        # Check if exists
-        response = self.client.table('conversations').select('context_id').eq('context_id', context_id).execute()
-
-        if not response.data:
-            # Create new conversation
-            conv_data = DataMapper.to_conversation(parsed)
-            self.client.table('conversations').insert(conv_data).execute()
-
-        # Cache it
+        resp = self.client.table('conversations').select('context_id').eq('context_id', context_id).execute()
+        if not resp.data:
+            self.client.table('conversations').insert(DataMapper.to_conversation(parsed)).execute()
         self.cache.cache_conversation(context_id)
         return context_id
 
     def update_stats(self, parsed: ParsedMessage, context_id: str) -> None:
-        """Update conversation statistics"""
-        # Get current stats
+        """Update conversation statistics using atomic increments to avoid race conditions"""
+        try:
+            # Call Postgres function for atomic increment
+            params = {
+                'p_context_id': context_id,
+                'p_message_increment': 1,
+                'p_token_increment': parsed.token_usage.total_tokens if parsed.token_usage else 0,
+                'p_input_token_increment': parsed.token_usage.input_tokens if parsed.token_usage else 0,
+                'p_output_token_increment': parsed.token_usage.output_tokens if parsed.token_usage else 0,
+                'p_cached_token_increment': parsed.token_usage.cached_tokens if parsed.token_usage else 0,
+                'p_ended_at': parsed.timestamp.isoformat()
+            }
+            self.client.rpc('increment_conversation_stats', params).execute()
+            # print(f"✓ Atomic increment successful for {context_id}")  # Debug
+        except Exception as e:
+            # Fallback to read-modify-write if function doesn't exist
+            # This can happen if the database function hasn't been created yet
+            error_str = str(e)
+            print(f"⚠️  RPC failed, using fallback for {context_id}: {e}")  # Debug
+            if 'function' in error_str.lower() and 'does not exist' in error_str.lower():
+                # Function doesn't exist, use fallback
+                self._update_stats_fallback(parsed, context_id)
+            else:
+                # Other error, use fallback too (to keep system running)
+                self._update_stats_fallback(parsed, context_id)
+
+    def _update_stats_fallback(self, parsed: ParsedMessage, context_id: str) -> None:
+        """Fallback method using read-modify-write (has race condition, but works)"""
         response = self.client.table('conversations').select('*').eq('context_id', context_id).execute()
 
         if not response.data:
@@ -394,23 +423,15 @@ class TaskManager:
         self.client = client
         self.cache = cache
 
-    def ensure_exists(self, parsed: ParsedMessage, context_id: str) -> str:
-        """Ensure task exists in database, return task_id"""
+    def ensure_exists(self, parsed: ParsedMessage, context_id: str, interaction_id: Optional[str] = None) -> str:
         task_id = parsed.id
-
-        # Check cache
-        if self.cache.get_task(task_id):
+        if not task_id:
+            raise ValueError("Missing task id (payload.id)")
+        if self.cache.has_task(task_id):
             return task_id
-
-        # Check if exists
-        response = self.client.table('tasks').select('task_id').eq('task_id', task_id).execute()
-
-        if not response.data:
-            # Create new task
-            task_data = DataMapper.to_task(parsed, context_id)
-            self.client.table('tasks').insert(task_data).execute()
-
-        # Cache it
+        resp = self.client.table('tasks').select('task_id').eq('task_id', task_id).execute()
+        if not resp.data:
+            self.client.table('tasks').insert(DataMapper.to_task(parsed, context_id, interaction_id)).execute()
         self.cache.cache_task(task_id)
         return task_id
 
@@ -428,11 +449,174 @@ class MessageManager:
     def __init__(self, client: Client):
         self.client = client
 
-    def insert(self, parsed: ParsedMessage, context_id: str, task_id: str) -> str:
-        """Insert message into database, return message_id"""
-        message_data = DataMapper.to_message(parsed, context_id, task_id)
-        self.client.table('messages').insert(message_data).execute()
-        return parsed.message_id
+    def insert(self, parsed: ParsedMessage, context_id: str, task_id: str, interaction_id: Optional[str] = None) -> tuple[str, bool]:
+        """
+        Insert message into database.
+        Returns (message_id, is_new) tuple where is_new indicates if the message was newly inserted.
+        """
+        if not parsed.message_id:
+            parsed.message_id = f"auto-{parsed.id}-{int(parsed.timestamp.timestamp())}"
+        msg = DataMapper.to_message(parsed, context_id, task_id, interaction_id)
+
+        try:
+            self.client.table('messages').insert(msg).execute()
+            return parsed.message_id, True
+        except Exception as e:
+            # Check if it's a duplicate key error
+            error_dict = str(e)
+            if '23505' in error_dict or 'duplicate key' in error_dict.lower():
+                # Message already exists, return existing ID
+                return parsed.message_id, False
+            else:
+                # Re-raise other errors
+                raise
+
+
+class InteractionManager:
+    """Manages interaction records (user query → agent response pairs)"""
+
+    def __init__(self, client: Client):
+        self.client = client
+        self._interaction_cache: Dict[str, Dict[str, Any]] = {}
+
+    def get_or_create_interaction(self, parsed: ParsedMessage, context_id: str) -> str:
+        """
+        Get or create an interaction record.
+        Returns the interaction_id (main task ID).
+        """
+        # Interaction ID is the main task ID (without parent)
+        interaction_id = self._determine_interaction_id(parsed)
+
+        if not interaction_id:
+            return None
+
+        # Check cache first
+        if interaction_id in self._interaction_cache:
+            return interaction_id
+
+        # Check if exists in database
+        resp = self.client.table('interactions').select('interaction_id').eq('interaction_id', interaction_id).execute()
+
+        if not resp.data:
+            # Create new interaction
+            self._create_interaction(parsed, context_id, interaction_id)
+
+        # Cache it
+        self._interaction_cache[interaction_id] = {'created': True}
+        return interaction_id
+
+    def _determine_interaction_id(self, parsed: ParsedMessage) -> Optional[str]:
+        """
+        Determine the main interaction ID from the message.
+        This is the main task ID (gdk-task-XXX) that initiated the user query.
+        """
+        # If this message has a parent_task_id, that's the interaction_id
+        if parsed.parent_task_id:
+            return parsed.parent_task_id
+
+        # If no parent, this IS the main task, so use its ID
+        # But only if it's actually a main task (starts with gdk-task-)
+        if parsed.id and parsed.id.startswith('gdk-task-'):
+            return parsed.id
+
+        return None
+
+    def _create_interaction(self, parsed: ParsedMessage, context_id: str, interaction_id: str) -> None:
+        """Create a new interaction record"""
+        # Calculate interaction number (how many interactions in this conversation so far)
+        resp = self.client.table('interactions').select('interaction_number').eq('context_id', context_id).order('interaction_number', desc=True).limit(1).execute()
+
+        interaction_number = 1
+        if resp.data:
+            interaction_number = resp.data[0].get('interaction_number', 0) + 1
+
+        interaction_data = {
+            'interaction_id': interaction_id,
+            'context_id': context_id,
+            'interaction_number': interaction_number,
+            'started_at': parsed.timestamp.isoformat(),
+            'primary_agent': parsed.agent_name,
+            'response_state': 'in_progress',
+            'metadata': {}
+        }
+
+        # If this is a user message, capture the query
+        if parsed.role == MessageRole.USER:
+            interaction_data['user_message_id'] = parsed.message_id
+            interaction_data['user_query'] = parsed.message_text
+            interaction_data['user_query_timestamp'] = parsed.timestamp.isoformat()
+
+        self.client.table('interactions').insert(interaction_data).execute()
+
+    def update_interaction(self, parsed: ParsedMessage, interaction_id: str) -> None:
+        """Update interaction with response, metrics, or completion status"""
+        if not interaction_id:
+            return
+
+        update_data = {}
+
+        # Update user query ONLY if this is from the main task (not a subtask delegation)
+        # The main task's ID equals the interaction_id
+        if parsed.role == MessageRole.USER and parsed.id == interaction_id:
+            update_data['user_message_id'] = parsed.message_id
+            update_data['user_query'] = parsed.message_text
+            update_data['user_query_timestamp'] = parsed.timestamp.isoformat()
+
+        # Update agent response ONLY if this is the main task's final response (not subtask response)
+        # The main task's ID equals the interaction_id
+        if parsed.role == MessageRole.AGENT and parsed.task_status == TaskStatus.COMPLETED and parsed.id == interaction_id:
+            update_data['agent_response_message_id'] = parsed.message_id
+            update_data['agent_response'] = parsed.message_text
+            update_data['agent_response_timestamp'] = parsed.timestamp.isoformat()
+            update_data['response_state'] = 'completed'
+            update_data['completed_at'] = parsed.timestamp.isoformat()
+
+        # Update token usage
+        if parsed.token_usage:
+            # Get current totals first
+            resp = self.client.table('interactions').select('total_tokens,total_input_tokens,total_output_tokens,total_cached_tokens').eq('interaction_id', interaction_id).execute()
+
+            if resp.data:
+                current = resp.data[0]
+                update_data['total_tokens'] = current.get('total_tokens', 0) + parsed.token_usage.total_tokens
+                update_data['total_input_tokens'] = current.get('total_input_tokens', 0) + parsed.token_usage.input_tokens
+                update_data['total_output_tokens'] = current.get('total_output_tokens', 0) + parsed.token_usage.output_tokens
+                update_data['total_cached_tokens'] = current.get('total_cached_tokens', 0) + parsed.token_usage.cached_tokens
+
+        # Track delegated agents
+        if parsed.agent_name and parsed.parent_task_id:
+            # This is a subtask, add agent to delegated_agents array
+            resp = self.client.table('interactions').select('delegated_agents,primary_agent').eq('interaction_id', interaction_id).execute()
+
+            if resp.data:
+                current_delegated = resp.data[0].get('delegated_agents', []) or []
+                primary = resp.data[0].get('primary_agent')
+
+                # Only add if not primary and not already in list
+                if parsed.agent_name != primary and parsed.agent_name not in current_delegated:
+                    current_delegated.append(parsed.agent_name)
+                    update_data['delegated_agents'] = current_delegated
+
+        # Update subtask count if this is a subtask
+        if parsed.parent_task_id:
+            resp = self.client.table('interactions').select('num_subtasks').eq('interaction_id', interaction_id).execute()
+            if resp.data:
+                update_data['num_subtasks'] = resp.data[0].get('num_subtasks', 0) + 1
+
+        # Update tool call count
+        if parsed.tool_calls or parsed.tool_results:
+            num_tool_calls = len(parsed.tool_calls) + len(parsed.tool_results)
+            resp = self.client.table('interactions').select('num_tool_calls').eq('interaction_id', interaction_id).execute()
+            if resp.data:
+                update_data['num_tool_calls'] = resp.data[0].get('num_tool_calls', 0) + num_tool_calls
+
+        # Increment message count
+        resp = self.client.table('interactions').select('total_messages').eq('interaction_id', interaction_id).execute()
+        if resp.data:
+            update_data['total_messages'] = resp.data[0].get('total_messages', 0) + 1
+
+        if update_data:
+            self.client.table('interactions').update(update_data).eq('interaction_id', interaction_id).execute()
 
 
 class ToolCallManager:
@@ -442,29 +626,99 @@ class ToolCallManager:
         self.client = client
 
     def insert_batch(self, parsed: ParsedMessage, message_id: str, task_id: str) -> List[str]:
-        """Insert tool calls into database, return list of UUIDs"""
+        """
+        Insert tool calls and link them to results.
+        Extracts tool invocations from parsed.tool_calls and matches with tool_result parts.
+        """
         tool_call_ids = []
 
+        # Step 1: Create mapping of function_call_id to tool results
+        tool_result_map = {}
+        for result in parsed.tool_results:
+            if result.get('type') == 'tool_result':
+                func_call_id = result.get('function_call_id')
+                if func_call_id:
+                    tool_result_map[func_call_id] = {
+                        'result_data': result.get('result_data', {}),
+                        'tool_name': result.get('tool_name')
+                    }
+
+        # Step 2: Extract tool invocations from parsed.tool_calls
+        function_calls = []
+
+        # Handle tool_invocation_start and llm_invocation types (already extracted by parser)
         for tool_call in parsed.tool_calls:
-            if tool_call.get('type') == 'llm_invocation':
+            call_type = tool_call.get('type')
+
+            if call_type == 'tool_invocation_start':
+                # Direct structure: {type, tool_name, tool_args, function_call_id}
+                function_calls.append({
+                    'id': tool_call.get('function_call_id'),
+                    'name': tool_call.get('tool_name'),
+                    'args': tool_call.get('tool_args', {})
+                })
+
+            elif call_type == 'llm_invocation':
+                # Extract from request.config structure
                 request = tool_call.get('request', {})
-                tools = request.get('config', {}).get('tools', [])
+                config = request.get('config', {})
+                tools = config.get('tools', [])
 
-                for tool_group in tools:
-                    function_declarations = tool_group.get('function_declarations', [])
+                # For llm_invocation, we need to find function calls in the response
+                # These are typically found in llm_response parts, not in the invocation itself
+                # So we'll also check message_parts for llm_response
+                pass
 
-                    for func in function_declarations:
-                        tool_data = {
-                            'message_id': message_id,
-                            'task_id': task_id,
-                            'tool_name': func.get('name'),
-                            'parameters': func.get('parameters'),
-                            'status': 'called',
-                            'timestamp': parsed.timestamp.isoformat()
-                        }
+        # Also extract function_call objects from llm_response parts
+        for part in parsed.message_parts:
+            if part.get('kind') == 'data':
+                data = part.get('data', {})
+                if data.get('type') == 'llm_response':
+                    response_data = data.get('data', {})
+                    content = response_data.get('content', {})
+                    parts = content.get('parts', [])
 
-                        response = self.client.table('tool_calls').insert(tool_data).execute()
-                        tool_call_ids.append(response.data[0]['id'])
+                    # Extract function_call from parts
+                    for p in parts:
+                        if 'function_call' in p:
+                            func_call = p['function_call']
+                            function_calls.append({
+                                'id': func_call.get('id'),
+                                'name': func_call.get('name'),
+                                'args': func_call.get('args', {})
+                            })
+
+        # Step 3: Insert tool calls with results if available
+        for func_call in function_calls:
+            func_call_id = func_call.get('id')
+            tool_name = func_call.get('name')
+
+            tool_data = {
+                'message_id': message_id,
+                'task_id': task_id,
+                'tool_name': tool_name,
+                'function_call_id': func_call_id,
+                'parameters': func_call.get('args'),
+                'status': 'called',
+                'result': None,
+                'timestamp': parsed.timestamp.isoformat()
+            }
+
+            # If we have a result for this call, update it
+            if func_call_id and func_call_id in tool_result_map:
+                result_info = tool_result_map[func_call_id]
+                tool_data['result'] = result_info['result_data']
+                tool_data['status'] = 'success'
+
+            try:
+                response = self.client.table('tool_calls').insert(tool_data).execute()
+                if response.data:
+                    tool_call_ids.append(response.data[0]['id'])
+            except Exception as e:
+                # Skip if duplicate, otherwise log the error
+                error_str = str(e)
+                if '23505' not in error_str and 'duplicate' not in error_str.lower():
+                    print(f"Warning: Failed to insert tool_call {tool_name}: {e}")
 
         return tool_call_ids
 
@@ -488,6 +742,7 @@ class SupabaseUploader:
         self.task_manager = TaskManager(self.client, self.cache)
         self.message_manager = MessageManager(self.client)
         self.tool_call_manager = ToolCallManager(self.client)
+        self.interaction_manager = InteractionManager(self.client)
 
     def upload_message(self, parsed: ParsedMessage) -> Dict[str, str]:
         """
@@ -497,31 +752,38 @@ class SupabaseUploader:
         result = {}
 
         try:
-            # 1. Ensure conversation exists
-            if parsed.context_id:
-                context_id = self.conversation_manager.ensure_exists(parsed)
-                result['conversation_id'] = context_id
+            if not parsed.context_id:
+                return {'error': 'Missing context_id'}
+            ctx = self.conversation_manager.ensure_exists(parsed)
+            result['context_id'] = ctx
 
-                # 2. Ensure task exists
-                if parsed.id:
-                    task_id = self.task_manager.ensure_exists(parsed, context_id)
-                    result['task_id'] = task_id
+            # Get or create interaction (user query → response pair)
+            interaction_id = self.interaction_manager.get_or_create_interaction(parsed, ctx)
+            result['interaction_id'] = interaction_id
 
-                    # 3. Insert message
-                    if parsed.message_id:
-                        message_id = self.message_manager.insert(parsed, context_id, task_id)
-                        result['message_id'] = message_id
+            if not parsed.id:
+                return {'error': 'Missing task id (payload.id)'}
+            t_id = self.task_manager.ensure_exists(parsed, ctx, interaction_id)
+            result['task_id'] = t_id
 
-                        # 4. Insert tool calls if any
-                        if parsed.tool_calls:
-                            tool_call_ids = self.tool_call_manager.insert_batch(parsed, message_id, task_id)
-                            result['tool_call_ids'] = tool_call_ids
+            m_id, is_new = self.message_manager.insert(parsed, ctx, t_id, interaction_id)
+            result['message_id'] = m_id
+            result['message_is_new'] = is_new
 
-                    # 5. Update task with token usage and completion
-                    self.task_manager.update(parsed, task_id)
+            # Always try to insert tool_calls even if message existed
+            # (in case tool_calls were missing from previous run)
+            if parsed.tool_calls or parsed.tool_results:
+                tc_ids = self.tool_call_manager.insert_batch(parsed, m_id, t_id)
+                result['tool_call_ids'] = tc_ids
 
-                # 6. Update conversation stats
-                self.conversation_manager.update_stats(parsed, context_id)
+            # Only update stats if this is a new message
+            if is_new:
+                self.task_manager.update(parsed, t_id)
+                self.conversation_manager.update_stats(parsed, ctx)
+
+                # Update interaction metrics
+                if interaction_id:
+                    self.interaction_manager.update_interaction(parsed, interaction_id)
 
         except Exception as e:
             print(f"Error uploading message: {e}")

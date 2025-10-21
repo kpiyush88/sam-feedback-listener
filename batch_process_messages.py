@@ -6,6 +6,7 @@ Process existing message files and upload them to Supabase
 """
 
 import sys
+import json
 from pathlib import Path
 from dotenv import load_dotenv
 from supabase_uploader import SupabaseUploader
@@ -57,6 +58,12 @@ def main():
         print("\nErrors encountered:")
         for error in stats['errors'][:10]:  # Show first 10 errors
             print(f"  - {error['file']}: {error['error']}")
+
+    # Show a sample of successful mappings if available
+    if stats.get('samples'):
+        print("\nSample inserted rows (UUIDs):")
+        for sample in stats['samples'][:5]:
+            print(json.dumps(sample, indent=2))
 
         if len(stats['errors']) > 10:
             print(f"  ... and {len(stats['errors']) - 10} more errors")

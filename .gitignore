@@ -93,3 +93,12 @@ logs/
 *.db
 *.sqlite*
 *.bak
+
+###############################################
+# Temporary Reports & Analysis
+###############################################
+*_REPORT.md
+*_SUMMARY.md
+*_fix_results.json
+*_audit_report.json
+monitor_tools.sh

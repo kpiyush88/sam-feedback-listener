@@ -296,3 +296,59 @@ On Ctrl+C:
 ## License
 
 Internal use only.
+
+## Recent Refactor Notes (2025-10-20)
+
+The live production schema uses TEXT primary keys (not UUID row IDs). Adjustments performed:
+
+1. Text Key Alignment
+  - Primary keys: `conversations.context_id`, `tasks.task_id`, `messages.message_id`.
+  - Foreign keys use these text identifiers directly; no UUID indirection.
+
+2. Extended User Fields
+  - Populated additional conversation columns (`user_id`, `user_company`, `user_location`, `user_language`, `user_authenticated`). Remaining profile depth kept in `metadata.user_profile`.
+
+3. Metadata De-duplication
+  - Removed redundant copies of `is_final`, `result_id`, `message_kind`, `is_partial`, token scalar fields from metadata when columns exist.
+  - Cleanup SQL executed to strip duplicates from existing rows.
+
+4. Token Usage Strategy
+  - Per-message token counts stored in top-level columns when present; detailed breakdown retained under `metadata.token_usage` only when available.
+
+5. Tool Calls
+  - References: `tool_calls.message_id -> messages.message_id`, `tool_calls.task_id -> tasks.task_id` remain TEXT.
+
+6. Tests Updated
+  - `test_datamapper.py` reflects text-key mapping (context_id/task_id/message_id).
+
+7. Audit Script
+  - Added `audit_supabase.py` to report nulls and duplication; provides remediation SQL.
+
+8. Auto Fallback for Missing messageId
+  - Generates deterministic `auto-<taskId>-<unix_ts>` when absent.
+
+### Running Mapping Tests
+```powershell
+python test_datamapper.py
+```
+
+### Batch Upload After Refactor
+Use existing batch script (shows UUIDs in output if samples enabled):
+```powershell
+python batch_process_messages.py "messages/message 2"
+```
+
+### Adjusting Analytics Queries
+When querying messages joined to conversations now use:
+```sql
+SELECT m.id AS message_row_uuid,
+     m.message_id AS external_message_id,
+     c.context_id,
+     c.user_email,
+     m.metadata->>'model_used' AS model_used
+FROM messages m
+JOIN conversations c ON m.conversation_id = c.id
+WHERE c.context_id = 'ctx_001';
+```
+
+Refer to `supabase_schema.sql` if adding new top-level analytical columns; otherwise keep them in `metadata` for flexibility.
