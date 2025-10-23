@@ -359,7 +359,17 @@ class ConversationManager:
             return context_id
         resp = self.client.table('conversations').select('context_id').eq('context_id', context_id).execute()
         if not resp.data:
-            self.client.table('conversations').insert(DataMapper.to_conversation(parsed)).execute()
+            try:
+                self.client.table('conversations').insert(DataMapper.to_conversation(parsed)).execute()
+            except Exception as e:
+                error_str = str(e)
+                # Check if it's a duplicate key error (race condition)
+                if '23505' in error_str or 'duplicate key' in error_str.lower():
+                    # Conversation was created by another thread, this is fine
+                    print(f"ℹ️  Conversation {context_id[:16]}... already exists (race condition, message_id: {parsed.message_id})")
+                else:
+                    # Some other error, re-raise
+                    raise
         self.cache.cache_conversation(context_id)
         return context_id
 
@@ -431,7 +441,17 @@ class TaskManager:
             return task_id
         resp = self.client.table('tasks').select('task_id').eq('task_id', task_id).execute()
         if not resp.data:
-            self.client.table('tasks').insert(DataMapper.to_task(parsed, context_id, interaction_id)).execute()
+            try:
+                self.client.table('tasks').insert(DataMapper.to_task(parsed, context_id, interaction_id)).execute()
+            except Exception as e:
+                error_str = str(e)
+                # Check if it's a duplicate key error (race condition)
+                if '23505' in error_str or 'duplicate key' in error_str.lower():
+                    # Task was created by another thread, this is fine
+                    print(f"ℹ️  Task {task_id[:24]}... already exists (race condition, message_id: {parsed.message_id})")
+                else:
+                    # Some other error, re-raise
+                    raise
         self.cache.cache_task(task_id)
         return task_id
 
@@ -546,7 +566,17 @@ class InteractionManager:
             interaction_data['user_query'] = parsed.message_text
             interaction_data['user_query_timestamp'] = parsed.timestamp.isoformat()
 
-        self.client.table('interactions').insert(interaction_data).execute()
+        try:
+            self.client.table('interactions').insert(interaction_data).execute()
+        except Exception as e:
+            error_str = str(e)
+            # Check if it's a duplicate key error (race condition)
+            if '23505' in error_str or 'duplicate key' in error_str.lower():
+                # Interaction was created by another thread, this is fine
+                print(f"ℹ️  Interaction {interaction_id[:24]}... already exists (race condition, message_id: {parsed.message_id})")
+            else:
+                # Some other error, re-raise
+                raise
 
     def update_interaction(self, parsed: ParsedMessage, interaction_id: str) -> None:
         """Update interaction with response, metrics, or completion status"""
