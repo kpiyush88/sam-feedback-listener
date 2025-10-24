@@ -509,18 +509,14 @@ class FeedbackMessageHandler(MessageHandler):
                     context_id = parsed.context_id if parsed and parsed.context_id else 'unknown'
                     db_message_id = parsed.message_id if parsed and parsed.message_id else 'unknown'
 
-                    # Check if this is a retryable error
-                    error_str = str(result['error'])
-                    is_socket_error = '10035' in error_str or 'non-blocking socket' in error_str.lower() or 'connectionterminated' in error_str.lower()
-
-                    if is_socket_error and attempt < max_retries - 1:
-                        # Retryable connection error, try again
-                        logger.warning(f"Connection error on message #{message_id} (attempt {attempt + 1}/{max_retries}), retrying in {retry_delay}s...")
+                    # Retry on any error if attempts remaining
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Upload error on message #{message_id} (attempt {attempt + 1}/{max_retries}): {result['error']}, retrying in {retry_delay}s...")
                         time.sleep(retry_delay)
                         retry_delay *= 2  # Exponential backoff
                         continue
                     else:
-                        # Non-retryable or final attempt
+                        # Final attempt failed
                         logger.error(f"Supabase upload failed for message #{message_id}: {result['error']} (context_id: {context_id[:16] if len(context_id) > 16 else context_id}..., message_id: {db_message_id[:16] if len(db_message_id) > 16 else db_message_id}...)")
                         self.upload_stats.record_failure()
                         return result
@@ -544,17 +540,14 @@ class FeedbackMessageHandler(MessageHandler):
                 except:
                     pass
 
-                error_str = str(e)
-                is_socket_error = '10035' in error_str or 'non-blocking socket' in error_str.lower() or 'connectionterminated' in error_str.lower()
-
-                if is_socket_error and attempt < max_retries - 1:
-                    # Retryable connection error, try again
-                    logger.warning(f"Connection exception on message #{message_id} (attempt {attempt + 1}/{max_retries}): {e}, retrying in {retry_delay}s...")
+                # Retry on any exception if attempts remaining
+                if attempt < max_retries - 1:
+                    logger.warning(f"Exception during upload on message #{message_id} (attempt {attempt + 1}/{max_retries}): {e}, retrying in {retry_delay}s...")
                     time.sleep(retry_delay)
                     retry_delay *= 2  # Exponential backoff
                     continue
                 else:
-                    # Non-retryable or final attempt
+                    # Final attempt failed
                     logger.error(f"Exception during Supabase upload for message #{message_id}: {e} (context_id: {context_id[:16] if len(context_id) > 16 else context_id}..., message_id: {db_message_id[:16] if len(db_message_id) > 16 else db_message_id}...)", exc_info=True)
                     self.upload_stats.record_failure()
                     return {'error': str(e)}
