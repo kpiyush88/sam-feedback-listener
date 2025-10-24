@@ -511,11 +511,11 @@ class FeedbackMessageHandler(MessageHandler):
 
                     # Check if this is a retryable error
                     error_str = str(result['error'])
-                    is_socket_error = '10035' in error_str or 'non-blocking socket' in error_str.lower()
+                    is_socket_error = '10035' in error_str or 'non-blocking socket' in error_str.lower() or 'connectionterminated' in error_str.lower()
 
                     if is_socket_error and attempt < max_retries - 1:
-                        # Retryable socket error, try again
-                        logger.warning(f"Socket error on message #{message_id} (attempt {attempt + 1}/{max_retries}), retrying in {retry_delay}s...")
+                        # Retryable connection error, try again
+                        logger.warning(f"Connection error on message #{message_id} (attempt {attempt + 1}/{max_retries}), retrying in {retry_delay}s...")
                         time.sleep(retry_delay)
                         retry_delay *= 2  # Exponential backoff
                         continue
@@ -545,11 +545,11 @@ class FeedbackMessageHandler(MessageHandler):
                     pass
 
                 error_str = str(e)
-                is_socket_error = '10035' in error_str or 'non-blocking socket' in error_str.lower()
+                is_socket_error = '10035' in error_str or 'non-blocking socket' in error_str.lower() or 'connectionterminated' in error_str.lower()
 
                 if is_socket_error and attempt < max_retries - 1:
-                    # Retryable socket error, try again
-                    logger.warning(f"Socket exception on message #{message_id} (attempt {attempt + 1}/{max_retries}): {e}, retrying in {retry_delay}s...")
+                    # Retryable connection error, try again
+                    logger.warning(f"Connection exception on message #{message_id} (attempt {attempt + 1}/{max_retries}): {e}, retrying in {retry_delay}s...")
                     time.sleep(retry_delay)
                     retry_delay *= 2  # Exponential backoff
                     continue
