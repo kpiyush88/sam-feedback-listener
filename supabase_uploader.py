@@ -22,11 +22,10 @@ from message_parser import MessageParser, ParsedMessage, MessageRole, TaskStatus
 
 
 class DatabaseCache:
-    """Simple existence cache for text keys"""
+    """Simple existence cache for conversation IDs (with consolidated schema, tasks are part of messages)"""
 
     def __init__(self):
         self._conversations: set[str] = set()
-        self._tasks: set[str] = set()
 
     def has_conversation(self, context_id: str) -> bool:
         return context_id in self._conversations
@@ -34,15 +33,8 @@ class DatabaseCache:
     def cache_conversation(self, context_id: str) -> None:
         self._conversations.add(context_id)
 
-    def has_task(self, task_id: str) -> bool:
-        return task_id in self._tasks
-
-    def cache_task(self, task_id: str) -> None:
-        self._tasks.add(task_id)
-
     def clear(self) -> None:
         self._conversations.clear()
-        self._tasks.clear()
 
 
 class MessageTypeDetector:
@@ -259,15 +251,14 @@ class DataMapper:
         return data
 
     @staticmethod
-    def to_task(parsed: ParsedMessage, context_id: str, interaction_id: Optional[str] = None) -> Dict[str, Any]:
+    def to_task_data(parsed: ParsedMessage) -> Dict[str, Any]:
+        """Extract task data for storage in messages table JSONB column"""
         task_type = 'subtask' if parsed.parent_task_id else 'main'
         is_final = DataMapper.extract_is_final(parsed)
         result_id = DataMapper.extract_result_id(parsed)
         return {
             'task_id': parsed.id,
-            'context_id': context_id,
             'parent_task_id': parsed.parent_task_id,
-            'interaction_id': interaction_id,
             'agent_name': parsed.agent_name,
             'task_type': task_type,
             'status': parsed.task_status.value if parsed.task_status else 'working',
@@ -281,7 +272,8 @@ class DataMapper:
         }
 
     @staticmethod
-    def to_message(parsed: ParsedMessage, context_id: str, task_id: str, interaction_id: Optional[str] = None) -> Dict[str, Any]:
+    def to_message(parsed: ParsedMessage, context_id: str, task_id: Optional[str] = None, interaction_id: Optional[str] = None) -> Dict[str, Any]:
+        """Convert ParsedMessage to new consolidated schema with JSONB columns"""
         token_usage = DataMapper.extract_per_message_token_usage(parsed)
         message_kind = DataMapper.extract_message_kind(parsed)
         is_partial = DataMapper.extract_is_partial(parsed)
@@ -289,59 +281,131 @@ class DataMapper:
         output_tokens = token_usage.get('output_tokens') if token_usage else None
         total_tokens = token_usage.get('total_tokens') if token_usage else None
         model_used = token_usage.get('model') if token_usage else None
+
+        # Extract message number from metadata if available
+        message_number = parsed.message_number
+        if not message_number and hasattr(parsed, 'raw_payload'):
+            message_number = parsed.raw_payload.get('metadata', {}).get('message_number')
+
         return {
             'message_id': parsed.message_id,
             'context_id': context_id,
             'task_id': task_id,
             'interaction_id': interaction_id,
-            'role': parsed.role.value if parsed.role else 'system',
-            'message_type': MessageTypeDetector.detect(parsed),
-            'agent_name': parsed.agent_name,
-            'content': DataMapper.extract_content_summary(parsed),
-            'parts': parsed.message_parts,
             'timestamp': parsed.timestamp.isoformat(),
-            'topic': parsed.topic,
-            'correlation_id': DataMapper.extract_correlation_id(parsed),
             'message_kind': message_kind,
-            'is_partial': is_partial,
-            'model_used': model_used,
+            'is_final': DataMapper.extract_is_final(parsed),
+            'message_number': message_number,
+            'role': parsed.role.value if parsed.role else 'system',
+            'agent_name': parsed.agent_name,
+            'sender_id': None,  # Not available in current parsed message
+            'feedback_id': getattr(parsed, 'feedback_id', None),
+            'correlation_id': DataMapper.extract_correlation_id(parsed),
+            'topic': parsed.topic,
             'input_tokens': input_tokens,
             'output_tokens': output_tokens,
             'total_tokens': total_tokens,
+            'model_used': model_used,
+            # JSONB columns for complete data storage
+            'message_content': parsed.message_parts,  # The message parts array
+            'user_context': {
+                'user_profile': {
+                    'id': parsed.user_profile.id if parsed.user_profile else None,
+                    'name': parsed.user_profile.name if parsed.user_profile else None,
+                    'email': parsed.user_profile.email if parsed.user_profile else None,
+                    'company': parsed.user_profile.company if parsed.user_profile else None,
+                    'location': parsed.user_profile.location if parsed.user_profile else None,
+                    'country': parsed.user_profile.country if parsed.user_profile else None,
+                    'authenticated': parsed.user_profile.authenticated if parsed.user_profile else None,
+                }
+            } if parsed.user_profile else None,
+            'status_data': None,  # Will be populated separately if needed
+            'request_data': None,  # Will be populated separately if needed
+            'message_payload': None,  # Full payload if needed
             'metadata': {
                 'agent_id': parsed.agent_id,
-                'message_number': parsed.message_number,
+                'message_type': MessageTypeDetector.detect(parsed),
+                'is_partial': is_partial,
                 'function_call_id': parsed.function_call_id,
                 'method': parsed.method
             }
         }
 
     @staticmethod
-    def to_task_update(parsed: ParsedMessage) -> Dict[str, Any]:
-        """Map ParsedMessage to task update data"""
-        update_data = {}
+    def extract_tool_calls(parsed: ParsedMessage) -> Optional[List[Dict[str, Any]]]:
+        """
+        Extract tool calls from ParsedMessage and return as JSONB-ready array.
+        Consolidates data from multiple sources into a single structure.
+        """
+        tool_calls = []
+        tool_result_map = {}
 
-        if parsed.task_status:
-            update_data['status'] = parsed.task_status.value
-            if parsed.task_status == TaskStatus.COMPLETED:
-                update_data['completed_at'] = parsed.timestamp.isoformat()
+        # Step 1: Create mapping of function_call_id to tool results
+        for result in parsed.tool_results:
+            if result.get('type') == 'tool_result':
+                func_call_id = result.get('function_call_id')
+                if func_call_id:
+                    tool_result_map[func_call_id] = {
+                        'result_data': result.get('result_data', {}),
+                        'tool_name': result.get('tool_name')
+                    }
 
-        if parsed.token_usage:
-            update_data['total_tokens'] = parsed.token_usage.total_tokens
-            update_data['input_tokens'] = parsed.token_usage.input_tokens
-            update_data['output_tokens'] = parsed.token_usage.output_tokens
-            update_data['cached_tokens'] = parsed.token_usage.cached_tokens
+        # Step 2: Extract tool invocations from parsed.tool_calls
+        function_calls = []
 
-            # Extract model used
-            if parsed.token_usage.by_model:
-                model_names = list(parsed.token_usage.by_model.keys())
-                if model_names:
-                    update_data['model_used'] = model_names[0]
+        # Handle tool_invocation_start type
+        for tool_call in parsed.tool_calls:
+            call_type = tool_call.get('type')
 
-        if parsed.artifacts_produced:
-            update_data['artifacts_produced'] = parsed.artifacts_produced
+            if call_type == 'tool_invocation_start':
+                function_calls.append({
+                    'id': tool_call.get('function_call_id'),
+                    'name': tool_call.get('tool_name'),
+                    'args': tool_call.get('tool_args', {})
+                })
 
-        return update_data
+        # Also extract function_call objects from llm_response parts
+        for part in parsed.message_parts:
+            if part.get('kind') == 'data':
+                data = part.get('data', {})
+                if data.get('type') == 'llm_response':
+                    response_data = data.get('data', {})
+                    content = response_data.get('content', {})
+                    parts = content.get('parts', [])
+
+                    # Extract function_call from parts
+                    for p in parts:
+                        if 'function_call' in p:
+                            func_call = p['function_call']
+                            function_calls.append({
+                                'id': func_call.get('id'),
+                                'name': func_call.get('name'),
+                                'args': func_call.get('args', {})
+                            })
+
+        # Step 3: Build tool call records with results if available
+        for func_call in function_calls:
+            func_call_id = func_call.get('id')
+            tool_name = func_call.get('name')
+
+            tool_data = {
+                'tool_name': tool_name,
+                'function_call_id': func_call_id,
+                'parameters': func_call.get('args', {}),
+                'status': 'called',
+                'result': None,
+                'timestamp': parsed.timestamp.isoformat()
+            }
+
+            # If we have a result for this call, update it
+            if func_call_id and func_call_id in tool_result_map:
+                result_info = tool_result_map[func_call_id]
+                tool_data['result'] = result_info['result_data']
+                tool_data['status'] = 'success'
+
+            tool_calls.append(tool_data)
+
+        return tool_calls if tool_calls else None
 
 
 class ConversationManager:
@@ -352,24 +416,20 @@ class ConversationManager:
         self.cache = cache
 
     def ensure_exists(self, parsed: ParsedMessage) -> str:
+        """Ensure conversation exists using UPSERT (atomic, no race condition)"""
         context_id = parsed.context_id
         if not context_id:
             raise ValueError("Missing context_id")
         if self.cache.has_conversation(context_id):
             return context_id
-        resp = self.client.table('conversations').select('context_id').eq('context_id', context_id).execute()
-        if not resp.data:
-            try:
-                self.client.table('conversations').insert(DataMapper.to_conversation(parsed)).execute()
-            except Exception as e:
-                error_str = str(e)
-                # Check if it's a duplicate key error (race condition)
-                if '23505' in error_str or 'duplicate key' in error_str.lower():
-                    # Conversation was created by another thread, this is fine
-                    print(f"ℹ️  Conversation {context_id[:16]}... already exists (race condition, message_id: {parsed.message_id})")
-                else:
-                    # Some other error, re-raise
-                    raise
+
+        # UPSERT: Insert if not exists, do nothing if exists (atomic operation)
+        # This eliminates race conditions and exception-based error handling
+        self.client.table('conversations').upsert(
+            DataMapper.to_conversation(parsed),
+            on_conflict='context_id'
+        ).execute()
+
         self.cache.cache_conversation(context_id)
         return context_id
 
@@ -426,57 +486,26 @@ class ConversationManager:
         self.client.table('conversations').update(update_data).eq('context_id', context_id).execute()
 
 
-class TaskManager:
-    """Manages task records in Supabase"""
-
-    def __init__(self, client: Client, cache: DatabaseCache):
-        self.client = client
-        self.cache = cache
-
-    def ensure_exists(self, parsed: ParsedMessage, context_id: str, interaction_id: Optional[str] = None) -> str:
-        task_id = parsed.id
-        if not task_id:
-            raise ValueError("Missing task id (payload.id)")
-        if self.cache.has_task(task_id):
-            return task_id
-        resp = self.client.table('tasks').select('task_id').eq('task_id', task_id).execute()
-        if not resp.data:
-            try:
-                self.client.table('tasks').insert(DataMapper.to_task(parsed, context_id, interaction_id)).execute()
-            except Exception as e:
-                error_str = str(e)
-                # Check if it's a duplicate key error (race condition)
-                if '23505' in error_str or 'duplicate key' in error_str.lower():
-                    # Task was created by another thread, this is fine
-                    print(f"ℹ️  Task {task_id[:24]}... already exists (race condition, message_id: {parsed.message_id})")
-                else:
-                    # Some other error, re-raise
-                    raise
-        self.cache.cache_task(task_id)
-        return task_id
-
-    def update(self, parsed: ParsedMessage, task_id: str) -> None:
-        """Update task with token usage and status"""
-        update_data = DataMapper.to_task_update(parsed)
-
-        if update_data:
-            self.client.table('tasks').update(update_data).eq('task_id', task_id).execute()
-
-
 class MessageManager:
-    """Manages message records in Supabase"""
+    """Manages message records in Supabase (consolidated schema with JSONB columns)"""
 
     def __init__(self, client: Client):
         self.client = client
 
-    def insert(self, parsed: ParsedMessage, context_id: str, task_id: str, interaction_id: Optional[str] = None) -> tuple[str, bool]:
+    def insert(self, parsed: ParsedMessage, context_id: str, task_id: Optional[str] = None, interaction_id: Optional[str] = None) -> tuple[str, bool]:
         """
-        Insert message into database.
+        Insert message into database with consolidated schema.
+        Tool calls and task data are now stored as JSONB in the messages table.
         Returns (message_id, is_new) tuple where is_new indicates if the message was newly inserted.
         """
         if not parsed.message_id:
             parsed.message_id = f"auto-{parsed.id}-{int(parsed.timestamp.timestamp())}"
+
+        # Get base message data
         msg = DataMapper.to_message(parsed, context_id, task_id, interaction_id)
+
+        # Add tool calls as JSONB column
+        msg['tool_calls'] = DataMapper.extract_tool_calls(parsed)
 
         try:
             self.client.table('messages').insert(msg).execute()
@@ -649,112 +678,8 @@ class InteractionManager:
             self.client.table('interactions').update(update_data).eq('interaction_id', interaction_id).execute()
 
 
-class ToolCallManager:
-    """Manages tool call records in Supabase"""
-
-    def __init__(self, client: Client):
-        self.client = client
-
-    def insert_batch(self, parsed: ParsedMessage, message_id: str, task_id: str) -> List[str]:
-        """
-        Insert tool calls and link them to results.
-        Extracts tool invocations from parsed.tool_calls and matches with tool_result parts.
-        """
-        tool_call_ids = []
-
-        # Step 1: Create mapping of function_call_id to tool results
-        tool_result_map = {}
-        for result in parsed.tool_results:
-            if result.get('type') == 'tool_result':
-                func_call_id = result.get('function_call_id')
-                if func_call_id:
-                    tool_result_map[func_call_id] = {
-                        'result_data': result.get('result_data', {}),
-                        'tool_name': result.get('tool_name')
-                    }
-
-        # Step 2: Extract tool invocations from parsed.tool_calls
-        function_calls = []
-
-        # Handle tool_invocation_start and llm_invocation types (already extracted by parser)
-        for tool_call in parsed.tool_calls:
-            call_type = tool_call.get('type')
-
-            if call_type == 'tool_invocation_start':
-                # Direct structure: {type, tool_name, tool_args, function_call_id}
-                function_calls.append({
-                    'id': tool_call.get('function_call_id'),
-                    'name': tool_call.get('tool_name'),
-                    'args': tool_call.get('tool_args', {})
-                })
-
-            elif call_type == 'llm_invocation':
-                # Extract from request.config structure
-                request = tool_call.get('request', {})
-                config = request.get('config', {})
-                tools = config.get('tools', [])
-
-                # For llm_invocation, we need to find function calls in the response
-                # These are typically found in llm_response parts, not in the invocation itself
-                # So we'll also check message_parts for llm_response
-                pass
-
-        # Also extract function_call objects from llm_response parts
-        for part in parsed.message_parts:
-            if part.get('kind') == 'data':
-                data = part.get('data', {})
-                if data.get('type') == 'llm_response':
-                    response_data = data.get('data', {})
-                    content = response_data.get('content', {})
-                    parts = content.get('parts', [])
-
-                    # Extract function_call from parts
-                    for p in parts:
-                        if 'function_call' in p:
-                            func_call = p['function_call']
-                            function_calls.append({
-                                'id': func_call.get('id'),
-                                'name': func_call.get('name'),
-                                'args': func_call.get('args', {})
-                            })
-
-        # Step 3: Insert tool calls with results if available
-        for func_call in function_calls:
-            func_call_id = func_call.get('id')
-            tool_name = func_call.get('name')
-
-            tool_data = {
-                'message_id': message_id,
-                'task_id': task_id,
-                'tool_name': tool_name,
-                'function_call_id': func_call_id,
-                'parameters': func_call.get('args'),
-                'status': 'called',
-                'result': None,
-                'timestamp': parsed.timestamp.isoformat()
-            }
-
-            # If we have a result for this call, update it
-            if func_call_id and func_call_id in tool_result_map:
-                result_info = tool_result_map[func_call_id]
-                tool_data['result'] = result_info['result_data']
-                tool_data['status'] = 'success'
-
-            try:
-                response = self.client.table('tool_calls').insert(tool_data).execute()
-                if response.data:
-                    tool_call_ids.append(response.data[0]['id'])
-            except Exception as e:
-                # Skip if duplicate, otherwise log the error
-                error_str = str(e)
-                if '23505' not in error_str and 'duplicate' not in error_str.lower():
-                    print(f"Warning: Failed to insert tool_call {tool_name}: {e}")
-
-        return tool_call_ids
-
-
 class SupabaseUploader:
-    """Main uploader class that coordinates all managers"""
+    """Main uploader class that coordinates all managers for consolidated schema"""
 
     def __init__(self, supabase_url: str = None, supabase_key: str = None):
         """Initialize Supabase client and managers"""
@@ -769,21 +694,22 @@ class SupabaseUploader:
         # Initialize cache and managers
         self.cache = DatabaseCache()
         self.conversation_manager = ConversationManager(self.client, self.cache)
-        self.task_manager = TaskManager(self.client, self.cache)
         self.message_manager = MessageManager(self.client)
-        self.tool_call_manager = ToolCallManager(self.client)
         self.interaction_manager = InteractionManager(self.client)
 
     def upload_message(self, parsed: ParsedMessage) -> Dict[str, str]:
         """
-        Upload a parsed message to Supabase
-        Returns dict with created record IDs
+        Upload a parsed message to Supabase using consolidated schema.
+        Tool calls and task data are now stored within the message record.
+        Returns dict with created record IDs.
         """
         result = {}
 
         try:
             if not parsed.context_id:
                 return {'error': 'Missing context_id'}
+
+            # Ensure conversation exists
             ctx = self.conversation_manager.ensure_exists(parsed)
             result['context_id'] = ctx
 
@@ -791,24 +717,17 @@ class SupabaseUploader:
             interaction_id = self.interaction_manager.get_or_create_interaction(parsed, ctx)
             result['interaction_id'] = interaction_id
 
-            if not parsed.id:
-                return {'error': 'Missing task id (payload.id)'}
-            t_id = self.task_manager.ensure_exists(parsed, ctx, interaction_id)
+            # Task ID is the parsed message ID
+            t_id = parsed.id
             result['task_id'] = t_id
 
+            # Insert message with consolidated data (includes tool_calls in JSONB)
             m_id, is_new = self.message_manager.insert(parsed, ctx, t_id, interaction_id)
             result['message_id'] = m_id
             result['message_is_new'] = is_new
 
-            # Always try to insert tool_calls even if message existed
-            # (in case tool_calls were missing from previous run)
-            if parsed.tool_calls or parsed.tool_results:
-                tc_ids = self.tool_call_manager.insert_batch(parsed, m_id, t_id)
-                result['tool_call_ids'] = tc_ids
-
             # Only update stats if this is a new message
             if is_new:
-                self.task_manager.update(parsed, t_id)
                 self.conversation_manager.update_stats(parsed, ctx)
 
                 # Update interaction metrics
