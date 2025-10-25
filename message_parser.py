@@ -200,8 +200,13 @@ class MessageParser:
 
     def _extract_user_profile(self, metadata: Dict) -> Optional[Dict[str, Any]]:
         """Extract complete user profile with original field names (no normalization)"""
-        user_properties = metadata.get('user_properties', {})
-        user_config = user_properties.get('a2aUserConfig', {})
+        user_properties = metadata.get('user_properties')
+
+        # Handle null user_properties gracefully
+        if user_properties is None:
+            return None
+
+        user_config = user_properties.get('a2aUserConfig', {}) if isinstance(user_properties, dict) else {}
         user_profile = user_config.get('user_profile', {})
         user_info = user_profile.get('user_info', {})
 
