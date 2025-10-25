@@ -1,583 +1,324 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Message Parser for SAM Agent Messages
-Parses JSON messages and extracts structured data for database storage
+Message Parser for SAM Feedback Listener
+Parses raw message JSON and extracts minimal set of fields, storing everything else as raw JSONB data.
+No field normalization - preserves original field names.
 """
 
 import json
-from datetime import datetime
 from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, field, asdict
-from enum import Enum
-from abc import ABC, abstractmethod
-
-
-class MessageRole(Enum):
-    """Enumeration of message roles"""
-    USER = "user"
-    AGENT = "agent"
-    SYSTEM = "system"
-
-
-class TaskStatus(Enum):
-    """Enumeration of task statuses"""
-    WORKING = "working"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-
-@dataclass
-class UserProfile:
-    """User profile information extracted from messages"""
-    # Core fields (stored in dedicated columns)
-    id: Optional[str] = None
-    email: Optional[str] = None
-    name: Optional[str] = None
-    country: Optional[str] = None
-    job_grade: Optional[str] = None
-    company: Optional[str] = None
-    manager_id: Optional[str] = None
-    location: Optional[str] = None
-    language: Optional[str] = None
-    authenticated: Optional[bool] = None
-
-    # Extended fields (stored in metadata)
-    job_title: Optional[str] = None
-    department: Optional[str] = None
-    employee_group: Optional[str] = None
-    fte: Optional[str] = None
-    manager_name: Optional[str] = None
-    division: Optional[str] = None
-    job_family: Optional[str] = None
-    job_sub_family: Optional[str] = None
-    cost_center: Optional[str] = None
-    business_unit: Optional[str] = None
-    contract_type: Optional[str] = None
-    position_grade: Optional[str] = None
-    salary_structure: Optional[str] = None
-    security_code: Optional[str] = None
-    auth_method: Optional[str] = None
-
-
-@dataclass
-class TokenUsage:
-    """Token usage statistics"""
-    total_tokens: int = 0
-    input_tokens: int = 0
-    output_tokens: int = 0
-    cached_tokens: int = 0
-    by_model: Dict[str, Dict[str, int]] = field(default_factory=dict)
+from datetime import datetime
+from pathlib import Path
+from dataclasses import dataclass, field
 
 
 @dataclass
 class ParsedMessage:
-    """Structured representation of a parsed message"""
-    # Metadata from file
-    topic: str
-    agent_id: str  # ID of the agent that sent this message
+    """Parsed message with minimal normalized fields + raw JSONB-friendly data"""
+
+    # Essential indexing fields
+    id: str
+    context_id: str
     timestamp: datetime
-    message_number: int
+    role: str  # 'user', 'agent', 'system' (raw string, not enum)
+    task_status: str  # 'working', 'completed', 'failed' (raw string, not enum)
 
-    # From payload
-    id: str  # task or message ID
-    jsonrpc: str
-    method: Optional[str] = None
-
-    # Message details
-    context_id: Optional[str] = None
+    # Convenience fields for common queries
     message_id: Optional[str] = None
-    role: Optional[MessageRole] = None
     agent_name: Optional[str] = None
-    message_parts: List[Dict] = field(default_factory=list)
+    agent_id: Optional[str] = None
     message_text: Optional[str] = None
-
-    # Task details
+    topic: Optional[str] = None
+    method: Optional[str] = None
     parent_task_id: Optional[str] = None
-    task_status: Optional[TaskStatus] = None
-    function_call_id: Optional[str] = None
-
-    # Token usage
-    token_usage: Optional[TokenUsage] = None
-
-    # Artifacts
-    artifacts_produced: List[Dict] = field(default_factory=list)
-
-    # Tool/function calls
-    tool_calls: List[Dict] = field(default_factory=list)
-
-    # Tool results
-    tool_results: List[Dict] = field(default_factory=list)
-
-    # User profile
-    user_profile: Optional[UserProfile] = None
-
-    # Original payload for reference
-    raw_payload: Dict = field(default_factory=dict)
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary, handling enums and datetime"""
-        result = asdict(self)
-        result['timestamp'] = self.timestamp.isoformat() if self.timestamp else None
-        result['role'] = self.role.value if self.role else None
-        result['task_status'] = self.task_status.value if self.task_status else None
-        return result
-
-
-class PayloadParser(ABC):
-    """Abstract base class for payload parsers"""
-
-    @abstractmethod
-    def can_parse(self, payload: Dict) -> bool:
-        """Check if this parser can handle the given payload"""
-        pass
-
-    @abstractmethod
-    def parse(self, payload: Dict, parsed: ParsedMessage) -> None:
-        """Parse the payload and populate the ParsedMessage"""
-        pass
-
-
-class ParamsParser(PayloadParser):
-    """Parser for message params"""
-
-    def can_parse(self, payload: Dict) -> bool:
-        return 'params' in payload
-
-    @staticmethod
-    def _aggregate_token_usage(parts: List[Dict]) -> Optional[TokenUsage]:
-        """Aggregate token usage from all llm_response parts"""
-        total_input = 0
-        total_output = 0
-        total_cached = 0
-        total_tokens = 0
-        by_model = {}
-
-        for part in parts:
-            if part.get('kind') == 'data':
-                data = part.get('data', {})
-                if data.get('type') == 'llm_response':
-                    # Extract from usage_metadata (inside data.data)
-                    response_data = data.get('data', {})
-                    usage_meta = response_data.get('usage_metadata', {})
-
-                    prompt_tokens = usage_meta.get('prompt_token_count', 0)
-                    candidates_tokens = usage_meta.get('candidates_token_count', 0)
-
-                    # Extract from usage field (inside data)
-                    usage = data.get('usage', {})
-                    input_tokens = usage.get('input_tokens', 0)
-                    output_tokens = usage.get('output_tokens', 0)
-                    cached_tokens = usage.get('cached_tokens', 0)
-
-                    # Prefer usage over usage_metadata if both exist
-                    if input_tokens > 0 or output_tokens > 0:
-                        total_input += input_tokens
-                        total_output += output_tokens
-                        total_cached += cached_tokens
-                    else:
-                        # Fallback to usage_metadata
-                        total_input += prompt_tokens
-                        total_output += candidates_tokens
-
-                    # Track by model
-                    model = usage.get('model')
-                    if model:
-                        if model not in by_model:
-                            by_model[model] = {'input': 0, 'output': 0}
-                        by_model[model]['input'] += (input_tokens or prompt_tokens)
-                        by_model[model]['output'] += (output_tokens or candidates_tokens)
-
-        # Calculate total
-        total_tokens = total_input + total_output
-
-        if total_input > 0 or total_output > 0:
-            return TokenUsage(
-                total_tokens=total_tokens,
-                input_tokens=total_input,
-                output_tokens=total_output,
-                cached_tokens=total_cached,
-                by_model=by_model
-            )
-        return None
-
-    def parse(self, payload: Dict, parsed: ParsedMessage) -> None:
-        params = payload['params']
-        message = params.get('message', {})
-
-        parsed.context_id = message.get('contextId')
-        parsed.message_id = message.get('messageId')
-
-        # Parse role
-        role_str = message.get('role')
-        if role_str:
-            try:
-                parsed.role = MessageRole(role_str)
-            except ValueError:
-                parsed.role = None
-
-        # Parse message parts
-        parts = message.get('parts', [])
-        parsed.message_parts = parts
-
-        # Extract text content
-        text_parts = [p.get('text', '') for p in parts if p.get('kind') == 'text']
-        parsed.message_text = ' '.join(text_parts) if text_parts else None
-
-        # Parse metadata
-        msg_metadata = message.get('metadata', {})
-        parsed.agent_name = msg_metadata.get('agent_name')
-        parsed.parent_task_id = msg_metadata.get('parentTaskId')
-        parsed.function_call_id = msg_metadata.get('function_call_id')
-
-        # Extract tool calls from parts (both llm_invocation and tool_invocation_start)
-        parsed.tool_calls = [
-            p.get('data', {}) for p in parts
-            if p.get('kind') == 'data' and p.get('data', {}).get('type') in ('llm_invocation', 'tool_invocation_start')
-        ]
-
-        # Extract tool results from parts
-        parsed.tool_results = [
-            p.get('data', {}) for p in parts
-            if p.get('kind') == 'data' and p.get('data', {}).get('type') == 'tool_result'
-        ]
-
-        # Aggregate token usage from all llm_response parts
-        token_usage = ParamsParser._aggregate_token_usage(parts)
-        if token_usage:
-            parsed.token_usage = token_usage
-
-        # Parse user profile if present (in system instructions)
-        UserProfileExtractor.extract(parts, parsed)
-
-
-class ResultParser(PayloadParser):
-    """Parser for message results"""
-
-    def can_parse(self, payload: Dict) -> bool:
-        return 'result' in payload
-
-    def parse(self, payload: Dict, parsed: ParsedMessage) -> None:
-        result = payload['result']
-        parsed.context_id = result.get('contextId')
-
-        # Delegate to specialized result parsers
-        if result.get('kind') == 'status-update':
-            StatusUpdateParser.parse(result, parsed)
-        elif result.get('kind') == 'task':
-            TaskResultParser.parse(result, parsed)
-
-
-class StatusUpdateParser:
-    """Parser for status update results"""
-
-    @staticmethod
-    def parse(result: Dict, parsed: ParsedMessage) -> None:
-        status_data = result.get('status', {})
-        status_str = status_data.get('state')
-        if status_str:
-            try:
-                parsed.task_status = TaskStatus(status_str)
-            except ValueError:
-                parsed.task_status = None
-
-        # Parse status message
-        status_message = status_data.get('message', {})
-        if status_message:
-            parsed.message_id = status_message.get('messageId')
-            parsed.agent_name = result.get('metadata', {}).get('agent_name')
-            parsed.role = MessageRole.AGENT
-
-            parts = status_message.get('parts', [])
-            parsed.message_parts = parts
-
-            # Extract tool calls from status update (both llm_invocation and tool_invocation_start)
-            parsed.tool_calls = [
-                p.get('data', {}) for p in parts
-                if p.get('kind') == 'data' and p.get('data', {}).get('type') in ('llm_invocation', 'tool_invocation_start')
-            ]
-
-            # Extract tool results from status update
-            parsed.tool_results = [
-                p.get('data', {}) for p in parts
-                if p.get('kind') == 'data' and p.get('data', {}).get('type') == 'tool_result'
-            ]
-
-            # Aggregate token usage from status update message parts
-            token_usage = ParamsParser._aggregate_token_usage(parts)
-            if token_usage:
-                parsed.token_usage = token_usage
-
-
-class TaskResultParser:
-    """Parser for task results"""
-
-    @staticmethod
-    def parse(result: Dict, parsed: ParsedMessage) -> None:
-        parsed.task_status = TaskStatus.COMPLETED
-        metadata = result.get('metadata', {})
-        parsed.agent_name = metadata.get('agent_name')
-        parsed.artifacts_produced = metadata.get('produced_artifacts', [])
-
-        # Parse token usage
-        token_data = metadata.get('token_usage', {})
-        if token_data:
-            parsed.token_usage = TokenUsage(
-                total_tokens=token_data.get('total_tokens', 0),
-                input_tokens=token_data.get('total_input_tokens', 0),
-                output_tokens=token_data.get('total_output_tokens', 0),
-                cached_tokens=token_data.get('total_cached_input_tokens', 0),
-                by_model=token_data.get('by_model', {})
-            )
-
-        # Parse final message
-        status = result.get('status', {})
-        if status:
-            message = status.get('message', {})
-            if message:
-                parsed.message_id = message.get('messageId')
-                parsed.role = MessageRole.AGENT
-
-                parts = message.get('parts', [])
-                parsed.message_parts = parts
-
-                text_parts = [p.get('text', '') for p in parts if p.get('kind') == 'text']
-                parsed.message_text = ' '.join(text_parts) if text_parts else None
-
-
-class UserProfileExtractor:
-    """Extracts user profile information from message parts and metadata"""
-
-    @staticmethod
-    def extract_from_metadata(metadata: Dict) -> Optional[UserProfile]:
-        """Extract complete user profile from top-level metadata.user_properties"""
-        try:
-            user_props = metadata.get('user_properties', {})
-            a2a_config = user_props.get('a2aUserConfig', {})
-            user_profile_data = a2a_config.get('user_profile', {})
-
-            if user_profile_data:
-                user_info = user_profile_data.get('user_info', user_profile_data)
-                return UserProfile(
-                    # Core fields
-                    id=user_info.get('id') or user_profile_data.get('id'),
-                    email=user_info.get('email') or user_profile_data.get('workEmail'),
-                    name=user_info.get('name') or user_profile_data.get('displayName'),
-                    country=user_info.get('country') or user_profile_data.get('country'),
-                    job_grade=user_info.get('jobGrade') or user_info.get('positionGrade') or user_profile_data.get('jobGrade'),
-                    company=user_info.get('company') or user_profile_data.get('company'),
-                    manager_id=user_info.get('manager') or user_profile_data.get('manager'),
-                    location=user_info.get('location') or user_profile_data.get('location'),
-                    language=user_info.get('nativePreferredLanguage') or user_profile_data.get('nativePreferredLanguage'),
-                    authenticated=user_info.get('authenticated'),
-
-                    # Extended fields
-                    job_title=user_info.get('jobTitle') or user_profile_data.get('jobTitle'),
-                    department=user_info.get('department') or user_profile_data.get('department'),
-                    employee_group=user_info.get('employeeGroup') or user_profile_data.get('employeeGroup'),
-                    fte=user_info.get('fte') or user_profile_data.get('fte'),
-                    manager_name=user_info.get('managerName') or user_profile_data.get('managerName'),
-                    division=user_info.get('division') or user_profile_data.get('division'),
-                    job_family=user_info.get('jobFamily') or user_profile_data.get('jobFamily'),
-                    job_sub_family=user_info.get('jobSubFamily') or user_profile_data.get('jobSubFamily'),
-                    cost_center=user_info.get('costCenter') or user_profile_data.get('costCenter'),
-                    business_unit=user_info.get('businessUnit') or user_profile_data.get('businessUnit'),
-                    contract_type=user_info.get('contractType') or user_profile_data.get('contractType'),
-                    position_grade=user_info.get('positionGrade') or user_profile_data.get('positionGrade'),
-                    salary_structure=user_info.get('salaryStructure') or user_profile_data.get('salaryStructure'),
-                    security_code=user_info.get('securityCode') or user_profile_data.get('securityCode'),
-                    auth_method=user_info.get('auth_method') or user_profile_data.get('auth_method')
-                )
-        except Exception:
-            pass
-        return None
-
-    @staticmethod
-    def extract(parts: List[Dict], parsed: ParsedMessage) -> None:
-        """Extract user profile from message parts (fallback method)"""
-        for part in parts:
-            if part.get('kind') == 'data':
-                data = part.get('data', {})
-                if data.get('type') == 'llm_invocation':
-                    request = data.get('request', {})
-                    config = request.get('config', {})
-                    system_instruction = config.get('system_instruction', '')
-
-                    # Look for user profile JSON in system instruction
-                    if 'user_info' in system_instruction or 'User Profile' in system_instruction:
-                        profile_data = UserProfileExtractor._extract_json(system_instruction)
-                        if profile_data:
-                            parsed.user_profile = UserProfileExtractor._create_profile(profile_data)
-
-    @staticmethod
-    def _extract_json(system_instruction: str) -> Optional[Dict]:
-        """Extract JSON object from system instruction"""
-        try:
-            start_idx = system_instruction.find('"user_info"')
-            if start_idx == -1:
-                start_idx = system_instruction.find('"id"')
-
-            if start_idx != -1:
-                # Find the surrounding JSON object
-                brace_count = 0
-                json_start = system_instruction.rfind('{', 0, start_idx)
-                json_end = -1
-
-                for i in range(json_start, len(system_instruction)):
-                    if system_instruction[i] == '{':
-                        brace_count += 1
-                    elif system_instruction[i] == '}':
-                        brace_count -= 1
-                        if brace_count == 0:
-                            json_end = i + 1
-                            break
-
-                if json_end != -1:
-                    profile_json = system_instruction[json_start:json_end]
-                    return json.loads(profile_json)
-        except (json.JSONDecodeError, ValueError):
-            pass
-        return None
-
-    @staticmethod
-    def _create_profile(profile_data: Dict) -> UserProfile:
-        """Create UserProfile from extracted data"""
-        user_info = profile_data.get('user_info', profile_data)
-        return UserProfile(
-            # Core fields
-            id=user_info.get('id'),
-            email=user_info.get('email') or user_info.get('workEmail'),
-            name=user_info.get('name') or user_info.get('displayName'),
-            country=user_info.get('country'),
-            job_grade=user_info.get('jobGrade') or user_info.get('positionGrade'),
-            company=user_info.get('company'),
-            manager_id=user_info.get('manager'),
-            location=user_info.get('location'),
-            language=user_info.get('nativePreferredLanguage'),
-            authenticated=user_info.get('authenticated'),
-
-            # Extended fields
-            job_title=user_info.get('jobTitle'),
-            department=user_info.get('department'),
-            employee_group=user_info.get('employeeGroup'),
-            fte=user_info.get('fte'),
-            manager_name=user_info.get('managerName'),
-            division=user_info.get('division'),
-            job_family=user_info.get('jobFamily'),
-            job_sub_family=user_info.get('jobSubFamily'),
-            cost_center=user_info.get('costCenter'),
-            business_unit=user_info.get('businessUnit'),
-            contract_type=user_info.get('contractType'),
-            position_grade=user_info.get('positionGrade'),
-            salary_structure=user_info.get('salaryStructure'),
-            security_code=user_info.get('securityCode'),
-            auth_method=user_info.get('auth_method')
-        )
-
-
-class MessageAnalyzer:
-    """Analyzes parsed messages to extract higher-level information"""
-
-    @staticmethod
-    def identify_conversation_id(parsed: ParsedMessage) -> str:
-        """Get the conversation/context ID"""
-        return parsed.context_id or 'unknown'
-
-    @staticmethod
-    def identify_main_task_id(parsed: ParsedMessage) -> str:
-        """Get the main task ID (parent if exists, otherwise current)"""
-        return parsed.parent_task_id or parsed.id
-
-    @staticmethod
-    def is_subtask(parsed: ParsedMessage) -> bool:
-        """Check if this is a subtask"""
-        return parsed.parent_task_id is not None
-
-    @staticmethod
-    def extract_query(parsed: ParsedMessage) -> Optional[str]:
-        """Extract the user query from the message"""
-        if parsed.role == MessageRole.USER and parsed.message_text:
-            # Filter out system messages
-            text = parsed.message_text
-            if "Request received by gateway" not in text:
-                return text
-        return None
-
-    @staticmethod
-    def extract_response(parsed: ParsedMessage) -> Optional[str]:
-        """Extract the agent response from the message"""
-        if parsed.role == MessageRole.AGENT and parsed.message_text:
-            return parsed.message_text
-        return None
+    message_number: Optional[int] = None
+    feedback_id: Optional[str] = None
+
+    # Raw message structures (for JSONB storage - no normalization)
+    message_parts: Optional[List[Dict[str, Any]]] = None
+    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    tool_results: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Raw data for JSONB columns (complete unmodified data)
+    raw_payload: Optional[Dict[str, Any]] = None  # Complete original payload
+    raw_user_profile: Optional[Dict[str, Any]] = None  # Complete user profile with original field names
+    raw_token_usage: Optional[Dict[str, Any]] = None  # Complete token usage data
 
 
 class MessageParser:
-    """Main parser class for SAM agent messages"""
-
-    def __init__(self):
-        """Initialize the parser with payload parsers"""
-        self.payload_parsers: List[PayloadParser] = [
-            ParamsParser(),
-            ResultParser()
-        ]
+    """Parses raw message JSON with minimal normalization, preserving original structure for JSONB storage"""
 
     def parse_message_file(self, file_path: str) -> ParsedMessage:
-        """Parse a message JSON file"""
+        """Parse a single message JSON file"""
         with open(file_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         return self.parse_message(data)
 
-    def parse_message(self, data: Dict) -> ParsedMessage:
-        """Parse a message dictionary"""
-        metadata = data.get('metadata', {})
-        payload = data.get('payload', {})
+    def parse_message(self, raw_message: Dict[str, Any]) -> ParsedMessage:
+        """Parse raw message dictionary"""
 
-        # Parse timestamp
+        metadata = raw_message.get('metadata', {})
+        payload = raw_message.get('payload', {})
+
+        # Extract timestamp
         timestamp_str = metadata.get('timestamp')
         timestamp = datetime.fromisoformat(timestamp_str) if timestamp_str else datetime.now()
 
-        # Initialize parsed message with metadata
+        # Determine message type and extract accordingly
+        message_type = self._determine_message_type(payload)
+
+        if message_type == 'params':
+            return self._parse_params_message(raw_message, payload, metadata, timestamp)
+        elif message_type == 'result':
+            return self._parse_result_message(raw_message, payload, metadata, timestamp)
+        else:
+            # Fallback to minimal parsing
+            return self._parse_minimal_message(raw_message, metadata, timestamp)
+
+    def _determine_message_type(self, payload: Dict[str, Any]) -> str:
+        """Determine the type of message"""
+        if 'params' in payload:
+            return 'params'
+        elif 'result' in payload:
+            return 'result'
+        else:
+            return 'unknown'
+
+    def _parse_params_message(self, raw_message: Dict, payload: Dict, metadata: Dict, timestamp: datetime) -> ParsedMessage:
+        """Parse a params-based message"""
+        params = payload.get('params', {})
+        message = params.get('message', {})
+
+        context_id = message.get('contextId') or params.get('contextId')
+        message_id = message.get('messageId')
+        role = message.get('role') or params.get('role') or 'agent'
+
         parsed = ParsedMessage(
-            topic=metadata.get('topic', ''),
-            agent_id=metadata.get('feedback_id', ''),  # Still read from 'feedback_id' in existing files
-            timestamp=timestamp,
-            message_number=metadata.get('message_number', 0),
             id=payload.get('id', ''),
-            jsonrpc=payload.get('jsonrpc', ''),
+            context_id=context_id or '',
+            timestamp=timestamp,
+            role=role,
+            task_status=self._extract_task_status(message, params),
+            message_id=message_id,
+            agent_name=params.get('agent_name'),
+            agent_id=metadata.get('sender_id'),
+            topic=metadata.get('topic'),
             method=payload.get('method'),
-            raw_payload=payload
+            parent_task_id=message.get('parentTaskId') or message.get('parent_task_id'),
+            message_number=metadata.get('message_number'),
+            feedback_id=metadata.get('feedback_id'),
+            message_parts=message.get('parts', []),
+            raw_payload=payload,
+            raw_user_profile=self._extract_user_profile(metadata),
+            raw_token_usage=self._extract_token_usage(message),
         )
 
-        # Extract user profile from metadata FIRST (priority source)
-        parsed.user_profile = UserProfileExtractor.extract_from_metadata(metadata)
-
-        # Find appropriate parser and parse payload
-        for parser in self.payload_parsers:
-            if parser.can_parse(payload):
-                parser.parse(payload, parsed)
-                break
-
-        # If still no user profile, try extracting from parts (fallback)
-        if not parsed.user_profile and parsed.message_parts:
-            UserProfileExtractor.extract(parsed.message_parts, parsed)
+        # Extract tool calls and results
+        self._extract_tool_data(message, parsed)
+        self._extract_message_text(message, parsed)
 
         return parsed
 
+    def _parse_result_message(self, raw_message: Dict, payload: Dict, metadata: Dict, timestamp: datetime) -> ParsedMessage:
+        """Parse a result-based message"""
+        result = payload.get('result', {})
 
-def main():
-    """Test the parser"""
-    import sys
+        context_id = result.get('contextId')
+        status_obj = result.get('status', {})
+        message = status_obj.get('message', {})
 
-    if len(sys.argv) < 2:
-        print("Usage: python message_parser.py <json_file>")
-        sys.exit(1)
+        parsed = ParsedMessage(
+            id=payload.get('id', ''),
+            context_id=context_id or '',
+            timestamp=timestamp,
+            role=message.get('role') or 'agent',
+            task_status=self._extract_task_status_from_result(result),
+            message_id=message.get('messageId'),
+            agent_name=result.get('metadata', {}).get('agent_name'),
+            agent_id=metadata.get('sender_id'),
+            topic=metadata.get('topic'),
+            parent_task_id=message.get('parentTaskId'),
+            message_number=metadata.get('message_number'),
+            feedback_id=metadata.get('feedback_id'),
+            message_parts=message.get('parts', []),
+            raw_payload=payload,
+            raw_user_profile=self._extract_user_profile(metadata),
+            raw_token_usage=self._extract_token_usage(message),
+        )
 
-    file_path = sys.argv[1]
-    parser = MessageParser()
-    parsed = parser.parse_message_file(file_path)
+        # Extract tool calls and results
+        self._extract_tool_data(message, parsed)
+        self._extract_message_text(message, parsed)
 
-    print(json.dumps(parsed.to_dict(), indent=2, default=str))
+        return parsed
+
+    def _parse_minimal_message(self, raw_message: Dict, metadata: Dict, timestamp: datetime) -> ParsedMessage:
+        """Parse with minimal information"""
+        return ParsedMessage(
+            id=raw_message.get('id', ''),
+            context_id='',
+            timestamp=timestamp,
+            role='system',
+            task_status='working',
+            topic=metadata.get('topic'),
+            feedback_id=metadata.get('feedback_id'),
+            raw_payload=raw_message,
+            raw_user_profile=self._extract_user_profile(metadata),
+        )
+
+    def _extract_task_status(self, message: Dict, params: Dict) -> str:
+        """Extract task status as raw string (no enum conversion)"""
+        # Check message state
+        state = message.get('state') or params.get('state')
+        if state:
+            if state == 'working':
+                return 'working'
+            elif state in ('completed', 'done'):
+                return 'completed'
+            elif state in ('failed', 'error'):
+                return 'failed'
+        return 'working'
+
+    def _extract_task_status_from_result(self, result: Dict) -> str:
+        """Extract task status from result object"""
+        status_obj = result.get('status', {})
+        state = status_obj.get('state')
+        if state:
+            if state == 'working':
+                return 'working'
+            elif state in ('completed', 'done'):
+                return 'completed'
+            elif state in ('failed', 'error'):
+                return 'failed'
+
+        # Check if final
+        if result.get('final'):
+            return 'completed'
+
+        return 'working'
+
+    def _extract_user_profile(self, metadata: Dict) -> Optional[Dict[str, Any]]:
+        """Extract complete user profile with original field names (no normalization)"""
+        user_properties = metadata.get('user_properties', {})
+        user_config = user_properties.get('a2aUserConfig', {})
+        user_profile = user_config.get('user_profile', {})
+        user_info = user_profile.get('user_info', {})
+
+        # Return the complete raw user_profile - preserve ALL original field names
+        if user_profile:
+            return user_profile
+        elif user_info:
+            return user_info
+
+        return None
+
+    def _extract_token_usage(self, message: Dict) -> Optional[Dict[str, Any]]:
+        """Extract token usage data as-is without normalization"""
+        if not message or 'parts' not in message:
+            return None
+
+        for part in message.get('parts', []):
+            if part.get('kind') == 'data':
+                data = part.get('data', {})
+                if data.get('type') == 'llm_response':
+                    response_data = data.get('data', {})
+
+                    # Return raw token usage - keep original field names
+                    usage = data.get('usage')
+                    usage_metadata = response_data.get('usage_metadata')
+
+                    if usage:
+                        return usage
+                    elif usage_metadata:
+                        return usage_metadata
+
+        return None
+
+    def _extract_tool_data(self, message: Dict, parsed: ParsedMessage) -> None:
+        """Extract tool invocations and results from message parts"""
+        if not message or 'parts' not in message:
+            return
+
+        for part in message.get('parts', []):
+            if part.get('kind') == 'data':
+                data = part.get('data', {})
+                data_type = data.get('type')
+
+                # Handle tool invocation start
+                if data_type == 'tool_invocation_start':
+                    parsed.tool_calls.append(data)
+
+                # Handle tool result
+                elif data_type == 'tool_result':
+                    parsed.tool_results.append(data)
+
+                # Handle llm_response with function calls
+                elif data_type == 'llm_response':
+                    response_data = data.get('data', {})
+                    content = response_data.get('content', {})
+                    parts = content.get('parts', [])
+
+                    for p in parts:
+                        if 'function_call' in p:
+                            # Store function call from LLM response
+                            parsed.tool_calls.append({
+                                'type': 'llm_response',
+                                'function_call': p['function_call']
+                            })
+
+    def _extract_message_text(self, message: Dict, parsed: ParsedMessage) -> None:
+        """Extract text content from message"""
+        if not message or 'parts' not in message:
+            return
+
+        text_parts = []
+
+        for part in message.get('parts', []):
+            if part.get('kind') == 'data':
+                data = part.get('data', {})
+                data_type = data.get('type')
+
+                if data_type == 'llm_response':
+                    response_data = data.get('data', {})
+                    content = response_data.get('content', {})
+                    parts = content.get('parts', [])
+
+                    for p in parts:
+                        if 'text' in p:
+                            text_parts.append(p['text'])
+
+                elif data_type == 'agent_progress_update':
+                    text_parts.append(data.get('status_text', ''))
+
+        if text_parts:
+            parsed.message_text = ' '.join(text_parts).strip()
 
 
-if __name__ == "__main__":
-    main()
+class MessageAnalyzer:
+    """Helper class for analyzing messages"""
+
+    @staticmethod
+    def is_agent_message(parsed: ParsedMessage) -> bool:
+        """Check if message is from agent"""
+        return parsed.role == 'agent'
+
+    @staticmethod
+    def is_user_message(parsed: ParsedMessage) -> bool:
+        """Check if message is from user"""
+        return parsed.role == 'user'
+
+    @staticmethod
+    def has_tool_calls(parsed: ParsedMessage) -> bool:
+        """Check if message has tool calls"""
+        return len(parsed.tool_calls) > 0
+
+    @staticmethod
+    def has_tool_results(parsed: ParsedMessage) -> bool:
+        """Check if message has tool results"""
+        return len(parsed.tool_results) > 0
+
+    @staticmethod
+    def is_completed(parsed: ParsedMessage) -> bool:
+        """Check if message indicates completion"""
+        return parsed.task_status == 'completed'
