@@ -94,6 +94,9 @@ class MessageParser:
         message_id = message.get('messageId')
         role = message.get('role') or params.get('role') or 'agent'
 
+        # Extract agent_name with fallback logic
+        agent_name = params.get('agent_name') or self._extract_agent_name_from_topic(metadata.get('topic'))
+
         parsed = ParsedMessage(
             id=payload.get('id', ''),
             context_id=context_id or '',
@@ -101,7 +104,7 @@ class MessageParser:
             role=role,
             task_status=self._extract_task_status(message, params),
             message_id=message_id,
-            agent_name=params.get('agent_name'),
+            agent_name=agent_name,
             agent_id=metadata.get('sender_id'),
             topic=metadata.get('topic'),
             method=payload.get('method'),
@@ -128,6 +131,9 @@ class MessageParser:
         status_obj = result.get('status', {})
         message = status_obj.get('message', {})
 
+        # Extract agent_name with fallback logic
+        agent_name = self._extract_agent_name(result, status_obj, metadata)
+
         parsed = ParsedMessage(
             id=payload.get('id', ''),
             context_id=context_id or '',
@@ -135,7 +141,7 @@ class MessageParser:
             role=message.get('role') or 'agent',
             task_status=self._extract_task_status_from_result(result),
             message_id=message.get('messageId'),
-            agent_name=result.get('metadata', {}).get('agent_name'),
+            agent_name=agent_name,
             agent_id=metadata.get('sender_id'),
             topic=metadata.get('topic'),
             parent_task_id=message.get('parentTaskId'),
@@ -197,6 +203,89 @@ class MessageParser:
             return 'completed'
 
         return 'working'
+
+    def _extract_agent_name(self, result: Dict, status_obj: Dict, metadata: Dict) -> Optional[str]:
+        """
+        Extract agent_name with multiple fallback strategies:
+        1. From result.status.message.metadata.agent_name (for status-update messages)
+        2. From result.metadata.agent_name
+        3. From status_obj.metadata.agent_name
+        4. From artifact URI in message parts (artifact://AgentName/...)
+        5. From topic string parsing
+        6. Return None if not found (will be populated by uploader)
+        """
+        # Try status.message.metadata.agent_name first (status-update messages)
+        message = status_obj.get('message', {})
+        agent_name = message.get('metadata', {}).get('agent_name')
+        if agent_name:
+            return agent_name
+
+        # Try result metadata
+        agent_name = result.get('metadata', {}).get('agent_name')
+        if agent_name:
+            return agent_name
+
+        # Try status object metadata
+        agent_name = status_obj.get('metadata', {}).get('agent_name')
+        if agent_name:
+            return agent_name
+
+        # Try extracting from artifact URI in message parts
+        agent_name = self._extract_agent_name_from_artifact(message)
+        if agent_name:
+            return agent_name
+
+        # Try extracting from topic
+        topic = metadata.get('topic')
+        agent_name = self._extract_agent_name_from_topic(topic)
+        if agent_name:
+            return agent_name
+
+        # Return None - uploader will handle population
+        return None
+
+    def _extract_agent_name_from_topic(self, topic: Optional[str]) -> Optional[str]:
+        """
+        Extract agent name from topic string.
+        Topic format: jde-sam-test/a2a/v1/agent/status/AgentName/...
+        """
+        if not topic:
+            return None
+
+        parts = topic.split('/')
+
+        # Look for /agent/status/AgentName/ pattern
+        try:
+            if 'agent' in parts and 'status' in parts:
+                agent_idx = parts.index('agent')
+                if agent_idx + 2 < len(parts) and parts[agent_idx + 1] == 'status':
+                    agent_name = parts[agent_idx + 2]
+                    # Filter out non-agent parts (gdk-gateway, etc.)
+                    if agent_name and not agent_name.startswith('gdk-'):
+                        return agent_name
+        except (ValueError, IndexError):
+            pass
+
+        return None
+
+    def _extract_agent_name_from_artifact(self, message: Dict) -> Optional[str]:
+        """
+        Extract agent name from artifact URI in message parts.
+        Artifact URI format: artifact://AgentName/...
+        """
+        parts = message.get('parts', [])
+        for part in parts:
+            if isinstance(part, dict) and 'file' in part:
+                file_info = part['file']
+                if isinstance(file_info, dict) and 'uri' in file_info:
+                    uri = file_info['uri']
+                    # Parse artifact://AgentName/...
+                    if uri.startswith('artifact://'):
+                        # Extract agent name from URI (first part after artifact://)
+                        agent_part = uri.replace('artifact://', '').split('/')[0]
+                        if agent_part and not agent_part.startswith('gdk-'):
+                            return agent_part
+        return None
 
     def _extract_user_profile(self, metadata: Dict) -> Optional[Dict[str, Any]]:
         """Extract complete user profile with original field names (no normalization)"""

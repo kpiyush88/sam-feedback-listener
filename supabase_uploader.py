@@ -113,7 +113,8 @@ class DataMapper:
         Extract tool calls from ParsedMessage with ORIGINAL field names (no normalization).
         Returns tool calls in JSONB-ready format preserving original structure.
         """
-        if not parsed.tool_calls:
+        # Check if there are ANY tool calls or results
+        if not parsed.tool_calls and not parsed.tool_results:
             return None
 
         tool_calls = []
@@ -255,10 +256,11 @@ class InteractionManager:
     def __init__(self, client: Client):
         self.client = client
         self._interaction_cache: Dict[str, Dict[str, Any]] = {}
+        self._agent_name_cache: Dict[str, str] = {}  # interaction_id -> agent_name
 
     def get_or_create_interaction(self, parsed: ParsedMessage, context_id: str) -> str:
         """Get or create an interaction record. Returns interaction_id."""
-        interaction_id = self._determine_interaction_id(parsed)
+        interaction_id = self._determine_interaction_id(parsed, context_id)
 
         if not interaction_id:
             return None
@@ -268,24 +270,75 @@ class InteractionManager:
             return interaction_id
 
         # Check if exists in database
-        resp = self.client.table('interactions').select('interaction_id').eq('interaction_id', interaction_id).execute()
+        resp = self.client.table('interactions').select('interaction_id,primary_agent').eq('interaction_id', interaction_id).execute()
 
         if not resp.data:
             self._create_interaction(parsed, context_id, interaction_id)
+        else:
+            # Cache agent_name for this interaction
+            primary_agent = resp.data[0].get('primary_agent')
+            if primary_agent:
+                self._agent_name_cache[interaction_id] = primary_agent
 
         # Cache it
         self._interaction_cache[interaction_id] = {'created': True}
         return interaction_id
 
-    def _determine_interaction_id(self, parsed: ParsedMessage) -> Optional[str]:
-        """Determine the main interaction ID from the message"""
+    def get_agent_name_for_interaction(self, interaction_id: str) -> Optional[str]:
+        """Get cached agent_name for an interaction"""
+        # Check cache first
+        if interaction_id in self._agent_name_cache:
+            return self._agent_name_cache[interaction_id]
+
+        # Query database
+        try:
+            resp = self.client.table('interactions').select('primary_agent').eq('interaction_id', interaction_id).execute()
+            if resp.data and resp.data[0].get('primary_agent'):
+                agent_name = resp.data[0]['primary_agent']
+                self._agent_name_cache[interaction_id] = agent_name
+                return agent_name
+        except:
+            pass
+
+        return None
+
+    def _determine_interaction_id(self, parsed: ParsedMessage, context_id: str) -> Optional[str]:
+        """
+        Determine the main interaction ID from the message.
+
+        Logic:
+        1. If message has parent_task_id, that's the interaction_id
+        2. If message.id starts with 'gdk-task-', it IS the interaction
+        3. If message.id starts with 'a2a_subtask_', find parent interaction from DB
+        """
         # If this message has a parent_task_id, that's the interaction_id
         if parsed.parent_task_id:
             return parsed.parent_task_id
 
-        # If no parent, this IS the main task
+        # If this IS the main task
         if parsed.id and parsed.id.startswith('gdk-task-'):
             return parsed.id
+
+        # For subtasks, need to find parent interaction from context and timestamp
+        if parsed.id and parsed.id.startswith('a2a_subtask_'):
+            parent_id = self._find_parent_interaction(context_id, parsed.timestamp)
+            return parent_id
+
+        return None
+
+    def _find_parent_interaction(self, context_id: str, timestamp: datetime) -> Optional[str]:
+        """Find the parent interaction for a subtask by context and timestamp"""
+        try:
+            resp = self.client.table('interactions').select('interaction_id').eq(
+                'context_id', context_id
+            ).lte('started_at', timestamp.isoformat()).order(
+                'started_at', desc=True
+            ).limit(1).execute()
+
+            if resp.data:
+                return resp.data[0]['interaction_id']
+        except Exception as e:
+            print(f"⚠️  Error finding parent interaction: {e}")
 
         return None
 
@@ -309,6 +362,9 @@ class InteractionManager:
 
         try:
             self.client.table('interactions').insert(interaction_data).execute()
+            # Cache agent_name if available
+            if parsed.agent_name:
+                self._agent_name_cache[interaction_id] = parsed.agent_name
         except Exception as e:
             error_str = str(e)
             if '23505' in error_str or 'duplicate key' in error_str.lower():
@@ -401,6 +457,15 @@ class SupabaseUploader:
             interaction_id = self.interaction_manager.get_or_create_interaction(parsed, ctx)
             result['interaction_id'] = interaction_id
 
+            # Populate agent_name if missing (use fallback from interaction cache)
+            if not parsed.agent_name and interaction_id and parsed.role == 'agent':
+                cached_agent = self.interaction_manager.get_agent_name_for_interaction(interaction_id)
+                if cached_agent:
+                    parsed.agent_name = cached_agent
+                    result['agent_name_source'] = 'cache'
+            else:
+                result['agent_name_source'] = 'parsed'
+
             # Task ID is the parsed message ID
             t_id = parsed.id
             result['task_id'] = t_id
@@ -423,18 +488,48 @@ class SupabaseUploader:
         return result
 
     def batch_upload_from_directory(self, directory: str, pattern: str = "*.json") -> Dict[str, Any]:
-        """Upload all JSON files from a directory. Returns statistics about the upload."""
+        """
+        Upload all JSON files from a directory. Returns statistics about the upload.
+
+        IMPORTANT: Files are sorted by timestamp to ensure parent interactions
+        are created before subtask messages, allowing proper interaction_id linking.
+        """
         stats = {
             'total_files': 0,
             'successful': 0,
             'failed': 0,
-            'errors': []
+            'errors': [],
+            'main_tasks_processed': 0,
+            'subtasks_processed': 0
         }
 
         directory_path = Path(directory)
         parser = MessageParser()
 
+        # Collect all files with their parsed timestamps
+        files_with_timestamps = []
         for json_file in directory_path.glob(pattern):
+            try:
+                parsed = parser.parse_message_file(str(json_file))
+                files_with_timestamps.append((json_file, parsed.timestamp, parsed.id))
+            except Exception as e:
+                stats['failed'] += 1
+                stats['errors'].append({
+                    'file': str(json_file),
+                    'error': f"Failed to parse for sorting: {str(e)}"
+                })
+
+        # Sort by timestamp to ensure main tasks (gdk-task-*) are processed before subtasks
+        # Secondary sort: main tasks before subtasks at same timestamp
+        def sort_key(item):
+            _, timestamp, task_id = item
+            is_subtask = task_id and task_id.startswith('a2a_subtask_')
+            return (timestamp, is_subtask)  # False (main task) sorts before True (subtask)
+
+        files_with_timestamps.sort(key=sort_key)
+
+        # Now upload in sorted order
+        for json_file, _, task_id in files_with_timestamps:
             stats['total_files'] += 1
 
             try:
@@ -449,6 +544,12 @@ class SupabaseUploader:
                     })
                 else:
                     stats['successful'] += 1
+
+                    # Track main tasks vs subtasks
+                    if task_id and task_id.startswith('gdk-task-'):
+                        stats['main_tasks_processed'] += 1
+                    elif task_id and task_id.startswith('a2a_subtask_'):
+                        stats['subtasks_processed'] += 1
 
             except Exception as e:
                 stats['failed'] += 1
