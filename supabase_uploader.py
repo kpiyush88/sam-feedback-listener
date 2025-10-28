@@ -43,13 +43,31 @@ class DataMapper:
 
     @staticmethod
     def extract_correlation_id(parsed: ParsedMessage) -> Optional[str]:
-        """Extract correlation ID from topic for indexed queries"""
-        if parsed.topic:
+        """
+        Extract correlation ID for indexed queries.
+
+        Logic:
+        - For status messages (topic contains '/status/'): Extract from last part of topic
+        - For request messages (topic contains '/request/'): Extract from parsed.id
+
+        Supports both gdk-task-* and a2a_subtask_* patterns.
+        """
+        if not parsed.topic:
+            return None
+
+        # For status messages, extract from topic's last part
+        if '/status/' in parsed.topic:
             parts = parsed.topic.split('/')
             if len(parts) > 0:
                 last_part = parts[-1]
                 if last_part.startswith('gdk-task-') or last_part.startswith('a2a_subtask_'):
                     return last_part
+
+        # For request messages, extract from parsed.id
+        elif '/request/' in parsed.topic:
+            if parsed.id and (parsed.id.startswith('gdk-task-') or parsed.id.startswith('a2a_subtask_')):
+                return parsed.id
+
         return None
 
     @staticmethod
@@ -103,7 +121,6 @@ class DataMapper:
                 'task_status': parsed.task_status,
                 'message_type': parsed.message_text is not None,
                 'method': getattr(parsed, 'method', None),
-                'message_number': getattr(parsed, 'message_number', None),
             }
         }
 
@@ -466,8 +483,19 @@ class SupabaseUploader:
             else:
                 result['agent_name_source'] = 'parsed'
 
-            # Task ID is the parsed message ID
-            t_id = parsed.id
+            # Determine task_id to align with interaction hierarchy
+            # For subtasks: use parent interaction_id as task_id for consistency
+            # For main tasks: use parsed.id as task_id
+            # This ensures task_id == interaction_id for proper relationship tracking
+            if parsed.id and parsed.id.startswith('a2a_subtask_'):
+                # Subtask: use parent interaction_id as task_id
+                t_id = interaction_id
+            elif parsed.id and parsed.id.startswith('gdk-task-'):
+                # Main task: use parsed.id as task_id
+                t_id = parsed.id
+            else:
+                # Fallback: use parsed.id
+                t_id = parsed.id
             result['task_id'] = t_id
 
             # Insert message with JSONB columns

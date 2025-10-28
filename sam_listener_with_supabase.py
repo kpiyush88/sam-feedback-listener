@@ -477,7 +477,6 @@ class FeedbackMessageHandler(MessageHandler):
                 "topic": topic,
                 "feedback_id": agent_id,
                 "timestamp": timestamp.isoformat(),
-                "message_number": self.message_count,
                 "sender_id": message.get_sender_id() if hasattr(message, 'get_sender_id') else None,
                 "correlation_id": message.get_correlation_id() if hasattr(message, 'get_correlation_id') else None,
                 "user_properties": user_properties if user_properties else None
@@ -487,7 +486,7 @@ class FeedbackMessageHandler(MessageHandler):
 
     def _upload_to_supabase(self, message_obj: Dict[str, Any]) -> Dict[str, Any]:
         """Upload message to Supabase with retry logic (runs in thread pool)"""
-        message_id = message_obj.get('metadata', {}).get('message_number', 'unknown')
+        message_id = message_obj.get('payload', {}).get('id', 'unknown')
         topic = message_obj.get('metadata', {}).get('topic', 'unknown')
 
         logger.debug(f"Starting Supabase upload for message #{message_id}")

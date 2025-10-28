@@ -32,7 +32,6 @@ class ParsedMessage:
     topic: Optional[str] = None
     method: Optional[str] = None
     parent_task_id: Optional[str] = None
-    message_number: Optional[int] = None
     feedback_id: Optional[str] = None
 
     # Raw message structures (for JSONB storage - no normalization)
@@ -109,7 +108,6 @@ class MessageParser:
             topic=metadata.get('topic'),
             method=payload.get('method'),
             parent_task_id=message.get('parentTaskId') or message.get('parent_task_id'),
-            message_number=metadata.get('message_number'),
             feedback_id=metadata.get('feedback_id'),
             message_parts=message.get('parts', []),
             raw_payload=payload,
@@ -145,7 +143,6 @@ class MessageParser:
             agent_id=metadata.get('sender_id'),
             topic=metadata.get('topic'),
             parent_task_id=message.get('parentTaskId'),
-            message_number=metadata.get('message_number'),
             feedback_id=metadata.get('feedback_id'),
             message_parts=message.get('parts', []),
             raw_payload=payload,

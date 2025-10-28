@@ -154,7 +154,6 @@ Individual messages in the conversation, storing complete message content and me
 | `sender_id` | text | YES | - | ID of the message sender |
 | `message_kind` | text | YES | - | Kind of message (from original payload) |
 | `is_final` | boolean | YES | false | Whether this is a final message |
-| `message_number` | integer | YES | - | Sequential message number in conversation |
 
 #### Token Usage Fields
 
