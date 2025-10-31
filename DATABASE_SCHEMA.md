@@ -1,139 +1,36 @@
 # SAM Feedback Listener - Database Schema Documentation
 
-**Version**: 1.0
-**Last Updated**: 2025-10-26
+**Version**: 2.1
+**Last Updated**: 2025-10-31
 **Database**: Supabase PostgreSQL
 
 ---
 
 ## Overview
 
-The database consists of three main tables that track agent conversations, interactions, and individual messages with complete JSONB storage of raw message data.
+The database uses a **single source of truth** design with the `messages` table as the core entity. All aggregated views (conversations, interactions) are derived from this table using SQL views.
 
-### Table Relationships
+### Design Philosophy
+
+- **Single Table Design**: Only `messages` table stores data
+- **Derived Views**: `conversations_derived` and `interactions_derived` computed on-demand from messages
+- **Always Accurate**: No synchronization bugs or stale data
+- **JSONB Flexibility**: Complete raw data preserved for schema evolution
+
+### Database Structure
 
 ```
-conversations (1)
-    ↓
-interactions (N)
-    ↓
-messages (N)
+messages (BASE TABLE)
+   ↓ derives
+   ├─ conversations_derived (VIEW)
+   └─ interactions_derived (VIEW)
 ```
-
----
-
-## Table: `conversations`
-
-Represents a single conversation session with a user, containing aggregated statistics.
-
-### Columns
-
-| Column | Type | Nullable | Default | Description |
-|--------|------|----------|---------|-------------|
-| `context_id` | text | NO | - | **Primary Key**. Unique identifier for the conversation session (e.g., `web-session-16644981729f49ec8d4a6c19ce719f74`) |
-| `started_at` | timestamp with time zone | NO | - | When the conversation started |
-| `ended_at` | timestamp with time zone | YES | - | When the conversation ended |
-| `total_messages` | integer | YES | 0 | Count of all messages in conversation |
-| `total_tokens` | integer | YES | 0 | Aggregated total tokens across all messages |
-| `total_input_tokens` | integer | YES | 0 | Aggregated input tokens |
-| `total_output_tokens` | integer | YES | 0 | Aggregated output tokens |
-| `total_cached_tokens` | integer | YES | 0 | Aggregated cached tokens |
-| `user_id` | text | YES | - | User identifier |
-| `user_email` | text | YES | - | User email address |
-| `user_name` | text | YES | - | User display name |
-| `user_country` | text | YES | - | User's country |
-| `user_company` | text | YES | - | User's company |
-| `user_location` | text | YES | - | User's location |
-| `user_language` | text | YES | - | User's preferred language |
-| `user_authenticated` | boolean | YES | - | Whether user is authenticated |
-| `session_id` | text | YES | - | Session identifier |
-| `metadata` | jsonb | YES | - | Additional conversation metadata |
-| `user_context_raw` | jsonb | YES | - | **Raw complete user profile** with original field names (jobGrade, workEmail, etc.) |
-| `created_at` | timestamp with time zone | YES | now() | Record creation timestamp |
-| `updated_at` | timestamp with time zone | YES | now() | Record last update timestamp |
-
-### Indexes
-
-- `context_id` (PRIMARY KEY)
-
-### Example `user_context_raw` JSONB Structure
-
-```json
-{
-  "id": "piyush.krishna@jdecoffee.com",
-  "name": "piyush.krishna@jdecoffee.com",
-  "email": "Piyush.Krishna@JDEcoffee.com",
-  "jobGrade": "CT 12",
-  "jobTitle": "Gl Technology Manager eCom & Digital",
-  "jobFamily": "E-Commerce (ECM)",
-  "jobSubFamily": "E-Commerce",
-  "department": "e-Com Technology (89932173)",
-  "country": "Netherlands",
-  "location": "Utrecht VV35 NL04 (NL04)",
-  "company": "KDE BV (0002)",
-  "manager": "05097122",
-  "managerName": "Leonie Ham",
-  "businessUnit": "Finance (00930143)",
-  "division": "Global Information Services (00930659)",
-  "costCenter": "DTC",
-  "contractType": "Indefinite",
-  "employeeGroup": "Internal Employee",
-  "fte": "1",
-  "positionGrade": "CT 12",
-  "salaryStructure": "NLD_LOC_C&T",
-  "securityCode": null,
-  "nativePreferredLanguage": "English",
-  "authenticated": true,
-  "auth_method": "oidc"
-}
-```
-
----
-
-## Table: `interactions`
-
-Represents a single user-agent interaction cycle (user query → agent response), tracking the conversation flow.
-
-### Columns
-
-| Column | Type | Nullable | Default | Description |
-|--------|------|----------|---------|-------------|
-| `interaction_id` | text | NO | - | **Primary Key**. Main task ID (e.g., `gdk-task-a396adc8b73640d486e06ee59474c199`) |
-| `context_id` | text | NO | - | **Foreign Key** → `conversations.context_id` |
-| `interaction_number` | integer | YES | - | Sequential number of this interaction in the conversation |
-| `started_at` | timestamp with time zone | NO | - | When the interaction started |
-| `completed_at` | timestamp with time zone | YES | - | When the interaction completed |
-| `duration_seconds` | numeric | YES | - | Total duration in seconds |
-| `user_message_id` | text | YES | - | Message ID of the user's query |
-| `user_query` | text | YES | - | The user's original query text |
-| `user_query_timestamp` | timestamp with time zone | YES | - | When user query was received |
-| `agent_response_message_id` | text | YES | - | Message ID of the agent's response |
-| `agent_response` | text | YES | - | The agent's final response text |
-| `agent_response_timestamp` | timestamp with time zone | YES | - | When agent responded |
-| `response_state` | text | YES | - | State of response: `in_progress`, `completed`, `failed` |
-| `primary_agent` | text | YES | - | Name of primary agent handling the interaction |
-| `delegated_agents` | text[] | YES | - | Array of agent names that were delegated subtasks |
-| `total_messages` | integer | YES | 0 | Count of messages in this interaction |
-| `num_subtasks` | integer | YES | 0 | Number of delegated subtasks |
-| `num_tool_calls` | integer | YES | 0 | Total tool calls made during interaction |
-| `total_tokens` | integer | YES | 0 | Total tokens used |
-| `total_input_tokens` | integer | YES | 0 | Input tokens |
-| `total_output_tokens` | integer | YES | 0 | Output tokens |
-| `total_cached_tokens` | integer | YES | 0 | Cached tokens |
-| `metadata` | jsonb | YES | - | Additional interaction metadata |
-| `created_at` | timestamp with time zone | YES | now() | Record creation timestamp |
-| `updated_at` | timestamp with time zone | YES | now() | Record last update timestamp |
-
-### Indexes
-
-- `interaction_id` (PRIMARY KEY)
-- `context_id` (FOREIGN KEY)
 
 ---
 
 ## Table: `messages`
 
-Individual messages in the conversation, storing complete message content and metadata with JSONB for flexible storage.
+The only physical table - stores all message data with complete JSONB storage of raw payloads.
 
 ### Columns
 
@@ -142,27 +39,12 @@ Individual messages in the conversation, storing complete message content and me
 | Column | Type | Nullable | Default | Description |
 |--------|------|----------|---------|-------------|
 | `message_id` | text | NO | - | **Primary Key**. Unique message identifier |
-| `context_id` | text | YES | - | **Foreign Key** → `conversations.context_id` |
-| `task_id` | text | YES | - | Associated task ID (main task identifier) |
-| `interaction_id` | text | YES | - | **Foreign Key** → `interactions.interaction_id` |
+| `context_id` | text | YES | - | Conversation session ID (e.g., `web-session-16644981729f49ec8d4a6c19ce719f74`) |
+| `task_id` | text | YES | - | **Actual task ID** of this message. For main tasks: `gdk-task-*`, for subtasks: `a2a_subtask_*`. |
 | `timestamp` | timestamp with time zone | NO | - | When the message was created |
 | `role` | text | YES | - | Message role: `user`, `agent`, `system` |
 | `agent_name` | text | YES | - | Name of the agent if role is `agent` |
 | `topic` | text | YES | - | Message topic path (e.g., `jde-sam-test/a2a/v1/agent/status/OrchestratorAgent/...`) |
-| `feedback_id` | text | YES | - | Feedback identifier |
-| `correlation_id` | text | YES | - | Correlation ID extracted from topic for joining |
-| `sender_id` | text | YES | - | ID of the message sender |
-| `message_kind` | text | YES | - | Kind of message (from original payload) |
-| `is_final` | boolean | YES | false | Whether this is a final message |
-
-#### Token Usage Fields
-
-| Column | Type | Nullable | Default | Description |
-|--------|------|----------|---------|-------------|
-| `input_tokens` | integer | YES | - | Input tokens used by this message |
-| `output_tokens` | integer | YES | - | Output tokens generated by this message |
-| `total_tokens` | integer | YES | - | Total tokens for this message |
-| `model_used` | text | YES | - | Model name that processed the message |
 
 #### JSONB Columns (Flexible Data Storage)
 
@@ -173,10 +55,6 @@ Individual messages in the conversation, storing complete message content and me
 | `raw_payload` | jsonb | YES | **Complete original payload** - Full raw message payload from upstream |
 | `user_context_raw` | jsonb | YES | **Raw user profile** - Complete user profile with original field names |
 | `token_usage_raw` | jsonb | YES | **Raw token usage data** - Token usage data as-is from original (may have variant field names) |
-| `user_context` | jsonb | YES | Processed user context (legacy, may be deprecated) |
-| `message_payload` | jsonb | YES | Additional message payload (legacy) |
-| `request_data` | jsonb | YES | Request data if applicable |
-| `status_data` | jsonb | YES | Status-related data |
 | `metadata` | jsonb | YES | Additional metadata (task_status, message_type, method, message_number, etc.) |
 
 #### System Fields
@@ -189,8 +67,118 @@ Individual messages in the conversation, storing complete message content and me
 ### Indexes
 
 - `message_id` (PRIMARY KEY)
-- `context_id` (FOREIGN KEY)
-- `interaction_id` (FOREIGN KEY)
+- `context_id` (for conversation queries)
+- `task_id` (for task/subtask queries)
+
+### Task Hierarchy
+
+Task delegation is tracked via `task_id`:
+
+**Main Task Messages:**
+- `task_id` = `gdk-task-abc123` (the main task)
+
+**Subtask Messages:**
+- `task_id` = `a2a_subtask_xyz789` (the specific subtask)
+
+**Example Query - Get all messages for a task:**
+```sql
+SELECT * FROM messages
+WHERE task_id = 'gdk-task-abc123'
+ORDER BY timestamp;
+```
+
+**Example Query - Get all subtasks in a context:**
+```sql
+SELECT task_id, COUNT(*) as message_count
+FROM messages
+WHERE context_id = 'web-session-xxx'
+  AND task_id LIKE 'a2a_subtask_%'
+GROUP BY task_id;
+```
+
+---
+
+## View: `conversations_derived`
+
+Derived view that aggregates conversation-level statistics from messages.
+
+### Columns
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `context_id` | text | Primary identifier for the conversation |
+| `started_at` | timestamp with time zone | Earliest message timestamp in conversation |
+| `ended_at` | timestamp with time zone | Latest message timestamp in conversation |
+| `total_messages` | bigint | Count of all messages in conversation |
+| `user_id` | text | User identifier (from first message with user_context_raw) |
+| `user_name` | text | User display name |
+| `user_country` | text | User's country |
+| `user_context_raw` | jsonb | Complete user profile with original field names |
+| `created_at` | timestamp with time zone | Same as started_at |
+| `updated_at` | timestamp with time zone | Same as ended_at |
+
+### Example Query
+
+```sql
+SELECT * FROM conversations_derived
+WHERE user_id = 'user@example.com'
+ORDER BY started_at DESC;
+```
+
+---
+
+## View: `interactions_derived`
+
+Derived view that aggregates interaction-level statistics for main tasks (user query → agent response pairs).
+
+### Columns
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `interaction_id` | text | Main task ID (same as task_id for main tasks, e.g., `gdk-task-xxx`) |
+| `context_id` | text | Reference to conversation |
+| `interaction_number` | bigint | Sequential number of this interaction within the conversation |
+| `started_at` | timestamp with time zone | Earliest message timestamp for this task |
+| `completed_at` | timestamp with time zone | Latest message timestamp where task_status = 'completed' |
+| `agent_response_message_id` | text | Last agent message ID for this task |
+| `agent_response_timestamp` | timestamp with time zone | Last agent message timestamp |
+| `response_state` | text | Task state: `in_progress` or `completed` |
+| `primary_agent` | text | First agent that handled this task |
+| `total_messages` | bigint | Count of messages in this interaction |
+| `created_at` | timestamp with time zone | Same as started_at |
+| `updated_at` | timestamp with time zone | Latest message timestamp |
+
+### Example Queries
+
+**Get all interactions for a conversation:**
+```sql
+SELECT * FROM interactions_derived
+WHERE context_id = 'web-session-xxx'
+ORDER BY interaction_number;
+```
+
+**Get completed interactions:**
+```sql
+SELECT
+    interaction_id,
+    primary_agent,
+    total_messages,
+    completed_at - started_at as duration
+FROM interactions_derived
+WHERE response_state = 'completed'
+ORDER BY started_at DESC;
+```
+
+**Get interaction statistics by agent:**
+```sql
+SELECT
+    primary_agent,
+    COUNT(*) as total_interactions,
+    AVG(total_messages) as avg_messages
+FROM interactions_derived
+WHERE response_state = 'completed'
+GROUP BY primary_agent;
+```
 
 ---
 
@@ -255,64 +243,47 @@ Stores tool calls with **original field names preserved** (id, name, args):
     "args": {
       "country": "netherlands",
       "employeeGroup": "Internal Employee",
-      "jobGrade": "CT 12",
-      "positionGrade": "CT 12",
-      "companyCode": "0002"
+      "jobGrade": "CT 12"
     },
     "timestamp": "2025-10-25T23:25:20.219656"
   },
   {
-    "type": "llm_response",
-    "id": "tooluse_eCu6UdBFQw-l-AZqBaqbKg",
-    "name": "create_chart_from_plotly_config",
-    "args": {
-      "config_format": "json",
-      "output_format": "png",
-      "config_content": "{...}",
-      "output_filename": "garden_growth_chart.png"
+    "type": "tool_result",
+    "id": "tooluse_IQlYnWTKS8yszLWEYBLqlg",
+    "name": "get_decision_trees_hr_decision_trees",
+    "result": {
+      "status": "success",
+      "data": {...}
     },
-    "timestamp": "2025-10-25T23:25:20.219656"
+    "timestamp": "2025-10-25T23:25:22.543210"
   }
 ]
 ```
 
-**Key Point**: Original field names are preserved:
-- `id` (not `function_call_id`)
-- `name` (not `tool_name`)
-- `args` (not `parameters`)
+### `user_context_raw` (Raw User Profile)
 
-### `raw_payload` (Complete Original Payload)
-
-Stores the entire original message payload structure:
+Complete user profile with all original field names preserved:
 
 ```json
 {
-  "id": "gdk-task-a396adc8b73640d486e06ee59474c199",
-  "jsonrpc": "2.0",
-  "result": {
-    "contextId": "web-session-16644981729f49ec8d4a6c19ce719f74",
-    "final": false,
-    "kind": "status-update",
-    "status": {
-      "message": {
-        "contextId": "web-session-16644981729f49ec8d4a6c19ce719f74",
-        "kind": "message",
-        "messageId": "...",
-        "parts": [...],
-        "role": "agent",
-        "taskId": "gdk-task-a396adc8b73640d486e06ee59474c199"
-      },
-      "state": "working",
-      "timestamp": "2025-10-24T12:48:51.740104+00:00"
-    },
-    "taskId": "gdk-task-a396adc8b73640d486e06ee59474c199"
-  }
+  "id": "piyush.krishna@jdecoffee.com",
+  "name": "piyush.krishna@jdecoffee.com",
+  "email": "Piyush.Krishna@JDEcoffee.com",
+  "jobGrade": "CT 12",
+  "jobTitle": "Gl Technology Manager eCom & Digital",
+  "jobFamily": "E-Commerce (ECM)",
+  "country": "Netherlands",
+  "location": "Utrecht VV35 NL04 (NL04)",
+  "company": "KDE BV (0002)",
+  "manager": "05097122",
+  "businessUnit": "Finance (00930143)",
+  "division": "Global Information Services (00930659)",
+  "costCenter": "DTC",
+  "contractType": "Indefinite",
+  "fte": "1",
+  "authenticated": true
 }
 ```
-
-### `user_context_raw` (Raw User Profile)
-
-Same as in conversations table - complete user profile with all original field names preserved.
 
 ### `token_usage_raw` (Raw Token Data)
 
@@ -353,7 +324,7 @@ Additional metadata about the message:
 
 ## Query Examples
 
-### Find All Tool Calls with Correlation
+### Find All Tool Calls
 
 ```sql
 SELECT
@@ -382,22 +353,21 @@ WHERE agent_name = 'JDE_HR_Agent'
 ORDER BY timestamp DESC;
 ```
 
-### Get Conversation with All Interactions and Messages
+### Get Conversation with All Messages
 
 ```sql
 SELECT
   c.context_id,
   c.started_at,
-  i.interaction_id,
-  i.user_query,
-  i.agent_response,
-  COUNT(m.message_id) as message_count
-FROM conversations c
-LEFT JOIN interactions i ON c.context_id = i.context_id
-LEFT JOIN messages m ON i.interaction_id = m.interaction_id
+  c.total_messages,
+  m.message_id,
+  m.timestamp,
+  m.role,
+  m.agent_name
+FROM conversations_derived c
+LEFT JOIN messages m ON c.context_id = m.context_id
 WHERE c.context_id = 'web-session-16644981729f49ec8d4a6c19ce719f74'
-GROUP BY c.context_id, c.started_at, i.interaction_id, i.user_query, i.agent_response
-ORDER BY i.started_at;
+ORDER BY m.timestamp;
 ```
 
 ### Extract Tool Call Arguments
@@ -414,43 +384,52 @@ FROM messages m,
 WHERE tc.value->>'name' = 'get_decision_trees_hr_decision_trees';
 ```
 
-### Find User Profile Information
+### Get Token Usage by Agent
 
 ```sql
 SELECT
-  m.message_id,
-  m.user_context_raw->>'id' as user_id,
-  m.user_context_raw->>'name' as user_name,
-  m.user_context_raw->>'email' as user_email,
-  m.user_context_raw->>'jobGrade' as job_grade,
-  m.user_context_raw->>'country' as country
-FROM messages m
-WHERE m.user_context_raw IS NOT NULL
-LIMIT 10;
+  agent_name,
+  COUNT(*) as message_count,
+  SUM((token_usage_raw->>'input_tokens')::int) as total_input_tokens,
+  SUM((token_usage_raw->>'output_tokens')::int) as total_output_tokens
+FROM messages
+WHERE token_usage_raw IS NOT NULL
+  AND agent_name IS NOT NULL
+GROUP BY agent_name;
 ```
 
 ---
 
 ## Data Integrity Notes
 
-1. **No Normalization**: All JSONB data preserves original field names from upstream sources
-2. **Null Handling**: Messages with null `user_properties` are handled gracefully (user_context_raw = null)
-3. **Token Variants**: Token usage may have different field names depending on source:
-   - `input_tokens`, `output_tokens` (from usage object)
-   - `prompt_token_count`, `candidates_token_count` (from usage_metadata)
-4. **Tool Call Correlation**: Tool calls can be correlated to results via the `id` field across different messages
-5. **Cascading**: Interactions and messages cascade from conversations via context_id
+1. **Single Source of Truth**: All data stored once in messages table
+2. **No Normalization**: All JSONB data preserves original field names from upstream sources
+3. **Null Handling**: Messages with null `user_properties` are handled gracefully (user_context_raw = null)
+4. **Token Storage**: All token usage data stored in `token_usage_raw` JSONB field with variant field names
+5. **Tool Call Correlation**: Tool calls can be correlated to results via the `id` field across different messages
+6. **Task Hierarchy**: Task/subtask relationships tracked via `task_id` patterns
+7. **Derived Views**: Always accurate as they're computed from source table
 
 ---
 
-## Current Statistics
+## Schema Evolution
 
-- **Total Conversations**: 2
-- **Total Interactions**: 3
-- **Total Messages**: 248
-- **Messages with Tool Calls**: 26
-- **Unique Tool Invocations**: 9
-- **Tool Types**: generate_answer_with_citations, get_decision_trees_hr_decision_trees, peer_JDE_HR_Agent, list_artifacts, signal_artifact_for_return, create_chart_from_plotly_config
+**Version 2.0 (2025-10-30) - Major Simplification**
+- **Removed**: `interactions` table (100% redundant - derived from messages)
+- **Removed**: `conversations` table (100% redundant - derived from messages)
+- **Removed**: `interaction_id` column from messages (was causing stale data)
+- **Added**: `conversations_derived` view (always accurate)
+- **Added**: `interactions_derived` view (always accurate)
+- **Removed**: 37 unused columns total
+- **Result**: Single-table design with 2 derived views
+
+**Benefits:**
+- No synchronization bugs
+- Always accurate data (views computed on-demand)
+- Simpler codebase (~250 lines removed)
+- No stale aggregations
+- Single source of truth
+- Can query conversations, interactions, or messages directly
 
 ---
 
@@ -458,4 +437,9 @@ LIMIT 10;
 
 | Version | Date | Changes |
 |---------|------|---------|
-| 1.0 | 2025-10-26 | Initial schema documentation with JSONB field details |
+| 1.0 | 2025-10-26 | Initial schema with 3 tables (conversations, interactions, messages) |
+| 1.1 | 2025-10-30 | Removed 35 unused/deprecated columns |
+| 1.2 | 2025-10-30 | Removed 2 redundant ID columns from messages |
+| 1.3 | 2025-10-30 | Bug fix: task_id stores actual task ID |
+| **2.0** | **2025-10-30** | **Major refactor: Single-table design with derived views. Dropped interactions and conversations tables.** |
+| 2.1 | 2025-10-31 | Removed user_email from conversations_derived, removed num_subtasks and num_tool_calls from interactions_derived |

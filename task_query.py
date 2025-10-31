@@ -114,20 +114,16 @@ class TaskQueryService:
 
     def get_tool_calls_by_task(self, task_id: str) -> List[ToolCall]:
         """
-        Get all tool calls for a given task ID (interaction_id or task_id)
+        Get all tool calls for a given task ID
 
         Args:
-            task_id: The task ID to query (can be interaction_id like 'gdk-task-XXX'
-                    or subtask task_id like 'a2a_subtask-XXX')
+            task_id: The task ID to query (can be 'gdk-task-XXX' or 'a2a_subtask-XXX')
 
         Returns:
             List of ToolCall objects sorted by timestamp
         """
-        # Determine if this is a main task or subtask
-        if task_id.startswith('gdk-task-'):
-            query = self.client.table('messages').select('*').eq('interaction_id', task_id)
-        else:
-            query = self.client.table('messages').select('*').eq('task_id', task_id)
+        # Query by task_id directly
+        query = self.client.table('messages').select('*').eq('task_id', task_id)
 
         response = query.not_.is_('tool_calls', 'null').order('timestamp').execute()
 
@@ -221,11 +217,8 @@ class TaskQueryService:
         Returns:
             List of ReasoningBlock objects containing conversation history
         """
-        # Determine if this is a main task or subtask
-        if task_id.startswith('gdk-task-'):
-            query = self.client.table('messages').select('*').eq('interaction_id', task_id)
-        else:
-            query = self.client.table('messages').select('*').eq('task_id', task_id)
+        # Query by task_id directly
+        query = self.client.table('messages').select('*').eq('task_id', task_id)
 
         response = query.not_.is_('message_content', 'null').order('timestamp').execute()
 
@@ -256,16 +249,32 @@ class TaskQueryService:
         Get all subtasks for a parent task
 
         Args:
-            parent_task_id: The parent task ID (interaction_id)
+            parent_task_id: The parent task ID (gdk-task-XXX)
 
         Returns:
             List of SubtaskInfo objects
         """
-        # Query all messages for this interaction that have a2a_subtask task_ids
+        # First get the context_id from the parent task
+        parent_response = (
+            self.client.table('messages')
+            .select('context_id')
+            .eq('task_id', parent_task_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not parent_response.data:
+            return []
+
+        context_id = parent_response.data[0]['context_id']
+
+        # Query all subtask messages in the same context
+        # Note: This gets all subtasks in the context. To filter by parent,
+        # we'd need to check raw_payload->'result'->'message'->>'parentTaskId'
         response = (
             self.client.table('messages')
             .select('*')
-            .eq('interaction_id', parent_task_id)
+            .eq('context_id', context_id)
             .like('task_id', 'a2a_subtask_%')
             .order('timestamp')
             .execute()
@@ -318,43 +327,45 @@ class TaskQueryService:
         Get complete task flow including tool calls, subtasks, and reasoning
 
         Args:
-            task_id: The task ID to query (interaction_id)
+            task_id: The task ID to query (gdk-task-XXX)
 
         Returns:
             TaskFlow object with complete task information
         """
-        # Get interaction metadata
-        interaction_response = (
-            self.client.table('interactions')
-            .select('*')
-            .eq('interaction_id', task_id)
+        # Get task metadata from messages (derive from messages table)
+        task_messages_response = (
+            self.client.table('messages')
+            .select('context_id, timestamp, metadata')
+            .eq('task_id', task_id)
+            .order('timestamp')
             .execute()
         )
 
-        if not interaction_response.data:
-            raise ValueError(f"Task {task_id} not found in interactions table")
+        if not task_messages_response.data:
+            raise ValueError(f"Task {task_id} not found in messages table")
 
-        interaction = interaction_response.data[0]
+        messages = task_messages_response.data
+        context_id = messages[0]['context_id']
+        started_at = messages[0]['timestamp']
+
+        # Find completed_at from messages with completed status
+        completed_at = None
+        for msg in reversed(messages):
+            if msg.get('metadata', {}).get('task_status') == 'completed':
+                completed_at = msg['timestamp']
+                break
 
         # Get all components
         tool_calls = self.get_tool_calls_with_io(task_id)
         subtasks = self.get_subtasks(task_id)
         reasoning = self.get_reasoning_blocks(task_id)
 
-        # Count total messages
-        message_count_response = (
-            self.client.table('messages')
-            .select('message_id', count='exact')
-            .eq('interaction_id', task_id)
-            .execute()
-        )
-
         return TaskFlow(
             task_id=task_id,
-            context_id=interaction['context_id'],
-            started_at=interaction['started_at'],
-            completed_at=interaction.get('completed_at'),
-            total_messages=message_count_response.count or 0,
+            context_id=context_id,
+            started_at=started_at,
+            completed_at=completed_at,
+            total_messages=len(messages),
             tool_calls=tool_calls,
             subtasks=subtasks,
             reasoning_blocks=reasoning

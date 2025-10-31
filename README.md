@@ -306,11 +306,12 @@ The live production schema uses TEXT primary keys (not UUID row IDs). Adjustment
   - Foreign keys use these text identifiers directly; no UUID indirection.
 
 2. Extended User Fields
-  - Populated additional conversation columns (`user_id`, `user_company`, `user_location`, `user_language`, `user_authenticated`). Remaining profile depth kept in `metadata.user_profile`.
+  - Populated core conversation columns (`user_id`, `user_email`, `user_name`, `user_country`). Complete user profile stored in `user_context_raw` JSONB field.
 
-3. Metadata De-duplication
-  - Removed redundant copies of `is_final`, `result_id`, `message_kind`, `is_partial`, token scalar fields from metadata when columns exist.
-  - Cleanup SQL executed to strip duplicates from existing rows.
+3. Schema Cleanup (2025-10-30)
+  - Removed 35 unused/deprecated columns across all tables
+  - Streamlined schema to use JSONB fields for flexible data storage
+  - All token data stored in `token_usage_raw` JSONB field
 
 4. Token Usage Strategy
   - Per-message token counts stored in top-level columns when present; detailed breakdown retained under `metadata.token_usage` only when available.
@@ -341,13 +342,14 @@ python batch_process_messages.py "messages/message 2"
 ### Adjusting Analytics Queries
 When querying messages joined to conversations now use:
 ```sql
-SELECT m.id AS message_row_uuid,
-     m.message_id AS external_message_id,
+SELECT m.message_id,
      c.context_id,
      c.user_email,
-     m.metadata->>'model_used' AS model_used
+     m.token_usage_raw->>'model' AS model_used,
+     m.token_usage_raw->>'input_tokens' AS input_tokens,
+     m.token_usage_raw->>'output_tokens' AS output_tokens
 FROM messages m
-JOIN conversations c ON m.conversation_id = c.id
+JOIN conversations c ON m.context_id = c.context_id
 WHERE c.context_id = 'ctx_001';
 ```
 
