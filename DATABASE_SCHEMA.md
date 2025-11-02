@@ -1,7 +1,7 @@
 # SAM Feedback Listener - Database Schema Documentation
 
-**Version**: 2.1
-**Last Updated**: 2025-10-31
+**Version**: 2.2
+**Last Updated**: 2025-11-01
 **Database**: Supabase PostgreSQL
 
 ---
@@ -13,9 +13,10 @@ The database uses a **single source of truth** design with the `messages` table 
 ### Design Philosophy
 
 - **Single Table Design**: Only `messages` table stores data
-- **Derived Views**: `conversations_derived` and `interactions_derived` computed on-demand from messages
+- **Derived Views**: `conversations_derived`, `interactions_derived`, and `tool_interactions_view` computed on-demand from messages
 - **Always Accurate**: No synchronization bugs or stale data
 - **JSONB Flexibility**: Complete raw data preserved for schema evolution
+- **Analytics Ready**: Specialized views for conversation, interaction, and tool call analysis
 
 ### Database Structure
 
@@ -23,7 +24,8 @@ The database uses a **single source of truth** design with the `messages` table 
 messages (BASE TABLE)
    ↓ derives
    ├─ conversations_derived (VIEW)
-   └─ interactions_derived (VIEW)
+   ├─ interactions_derived (VIEW)
+   └─ tool_interactions_view (VIEW)
 ```
 
 ---
@@ -179,6 +181,139 @@ FROM interactions_derived
 WHERE response_state = 'completed'
 GROUP BY primary_agent;
 ```
+
+---
+
+## View: `tool_interactions_view`
+
+**Purpose**: Analytics view that tracks complete tool call lifecycles at the interaction level, linking all 4 phases: pre-reasoning, LLM decision, tool invocation, and tool result.
+
+**Version**: 1.8
+**Added**: 2025-11-01
+**Updated**: 2025-11-02 - Fixed multi-tool call handling + conditional pre_reasoning_timestamp
+
+### Overview
+
+This view provides a complete picture of each tool call made by agents, combining:
+1. **Pre-reasoning** - Agent's status update before deciding to call a tool (optional)
+2. **LLM Decision** - The LLM's response that includes the tool call decision
+3. **Tool Invocation** - The actual tool call with input arguments
+4. **Tool Result** - The output/result returned by the tool
+
+Each row represents **one complete tool call cycle** with all associated data.
+
+### Linking Strategy
+
+Tool call phases are linked using:
+- **task_id + agent_name** - Structural grouping within the same task/agent
+- **tool_call_id** - Links phases 2-4 (LLM decision, invocation, result)
+- **Sequential ordering** - Pre-reasoning identified by message sequence (LEAD window function)
+
+### Columns
+
+| Column | Type | Nullable | Description |
+|--------|------|----------|-------------|
+| `interaction_id` | text | NO | Main task ID (gdk-task-*) or context_id fallback |
+| `context_id` | text | YES | Conversation session ID |
+| `task_id` | text | YES | Actual task ID (main task or subtask) |
+| `tool_call_id` | text | YES | Unique identifier for this tool call |
+| `tool_name` | text | YES | Name of the tool that was called |
+| `agent_name` | text | YES | Agent that made the tool call |
+| `pre_reasoning_text` | text | YES | Status text from agent_progress_update before tool decision |
+| `pre_reasoning_timestamp` | timestamptz | YES | When the pre-reasoning occurred |
+| `llm_decision_content` | jsonb | YES | Complete LLM response including tool decision |
+| `llm_decision_timestamp` | timestamptz | YES | When LLM decided to call the tool |
+| `tool_input_args` | jsonb | YES | Input arguments passed to the tool |
+| `invocation_timestamp` | timestamptz | YES | When tool was invoked |
+| `tool_output_result` | jsonb | YES | Result/output returned by the tool |
+| `result_timestamp` | timestamptz | YES | When tool result was received |
+| `execution_duration_ms` | float | YES | Tool execution time in milliseconds |
+| `token_usage` | jsonb | YES | Token usage for this tool call cycle |
+| `success_status` | boolean | YES | True if result.status='success', False if 'error', NULL otherwise |
+
+### Example Queries
+
+**Get all tool calls for an interaction:**
+```sql
+SELECT
+    tool_name,
+    agent_name,
+    pre_reasoning_text,
+    execution_duration_ms,
+    success_status
+FROM tool_interactions_view
+WHERE interaction_id = 'gdk-task-abc123'
+ORDER BY invocation_timestamp;
+```
+
+**Analyze tool performance by agent:**
+```sql
+SELECT
+    agent_name,
+    tool_name,
+    COUNT(*) as total_calls,
+    AVG(execution_duration_ms) as avg_duration_ms,
+    COUNT(CASE WHEN success_status = true THEN 1 END) as successful_calls,
+    COUNT(pre_reasoning_text) as calls_with_reasoning
+FROM tool_interactions_view
+GROUP BY agent_name, tool_name
+ORDER BY total_calls DESC;
+```
+
+**Find slowest tool calls:**
+```sql
+SELECT
+    tool_name,
+    agent_name,
+    execution_duration_ms,
+    invocation_timestamp,
+    jsonb_pretty(tool_input_args) as inputs
+FROM tool_interactions_view
+WHERE execution_duration_ms IS NOT NULL
+ORDER BY execution_duration_ms DESC
+LIMIT 10;
+```
+
+**Get complete tool call lifecycle for analysis:**
+```sql
+SELECT
+    tool_call_id,
+    tool_name,
+    agent_name,
+    pre_reasoning_text,
+    jsonb_pretty(tool_input_args) as inputs,
+    jsonb_pretty(tool_output_result) as outputs,
+    execution_duration_ms,
+    llm_decision_timestamp,
+    result_timestamp
+FROM tool_interactions_view
+WHERE tool_call_id = 'tooluse_abc123';
+```
+
+**Tool usage statistics:**
+```sql
+SELECT
+    tool_name,
+    COUNT(*) as times_used,
+    COUNT(DISTINCT agent_name) as agents_using,
+    AVG(execution_duration_ms) as avg_duration,
+    MIN(execution_duration_ms) as min_duration,
+    MAX(execution_duration_ms) as max_duration
+FROM tool_interactions_view
+GROUP BY tool_name
+ORDER BY times_used DESC;
+```
+
+### Notes
+
+- **Multi-Tool Handling**: When an LLM response contains multiple tool calls, each tool gets its own row with the same `llm_decision_timestamp` and `post_reasoning_text`
+- **Pre-reasoning Coverage**: Not all tool calls have pre-reasoning (depends on agent implementation and conversation state)
+- **Pre-reasoning Sources**: Two-pronged extraction strategy (prioritizes `llm_invocation` conversation history, falls back to `agent_progress_update`)
+- **Timestamp Consistency**: `pre_reasoning_timestamp` only populated when actual reasoning text exists (prevents NULL text with filled timestamp)
+- **Performance**: View uses window functions and joins - consider adding filters for large datasets
+- **Analytics Ready**: One row per tool call makes it ideal for BI tools and dashboards
+- **Token Tracking**: Token usage captured from the LLM decision phase
+- **Lifecycle Complete**: Captures the full "thinking → deciding → executing → receiving" cycle
 
 ---
 
@@ -443,3 +578,4 @@ GROUP BY agent_name;
 | 1.3 | 2025-10-30 | Bug fix: task_id stores actual task ID |
 | **2.0** | **2025-10-30** | **Major refactor: Single-table design with derived views. Dropped interactions and conversations tables.** |
 | 2.1 | 2025-10-31 | Removed user_email from conversations_derived, removed num_subtasks and num_tool_calls from interactions_derived |
+| 2.2 | 2025-11-01 | Added tool_interactions_view for complete tool call lifecycle tracking with pre-reasoning, LLM decision, invocation, and result phases |
