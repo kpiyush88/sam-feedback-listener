@@ -115,20 +115,44 @@ deduplicated_tool_data AS (
   FROM combined_tool_data
   WHERE tool_call_id IS NOT NULL
   ORDER BY tool_call_id, invocation_timestamp DESC
+),
+
+-- Add interaction_id: maps all tool calls to the original user query (main task)
+-- For main tasks (gdk-task-*), use the task ID directly
+-- For subtasks (a2a_subtask_*), look up the parentTaskId from the A2A framework metadata
+with_interaction_id AS (
+  SELECT
+    dtd.*,
+    CASE
+      -- Main task: use source_id as interaction_id
+      WHEN dtd.source_id LIKE 'gdk-task-%' THEN dtd.source_id
+
+      -- Subtask: lookup parentTaskId from message metadata (A2A framework)
+      WHEN dtd.source_id LIKE 'a2a_subtask_%' THEN (
+        SELECT m.raw_payload->'params'->'message'->'metadata'->>'parentTaskId'
+        FROM messages m
+        WHERE m.raw_payload->>'id' = dtd.source_id
+          AND m.raw_payload->'params'->'message'->'metadata'->>'parentTaskId' IS NOT NULL
+        LIMIT 1
+      )
+
+      ELSE NULL
+    END AS interaction_id
+  FROM deduplicated_tool_data dtd
 )
 
--- Final SELECT with requested fields
+-- Final SELECT with requested fields including interaction_id
 SELECT
+  interaction_id,
   context_id,
-  source_id,
   tool_call_id,
   tool_name,
   tool_input_args,
   invocation_timestamp,
   tool_output_result
-FROM deduplicated_tool_data
+FROM with_interaction_id
 ORDER BY invocation_timestamp DESC;
 
 -- Add comment to the view
 COMMENT ON VIEW tool_interactions_view IS
-'Simplified analytics view tracking tool call lifecycles with essential fields: context_id, source_id, tool_call_id, tool_name, tool_input_args, invocation_timestamp, and tool_output_result. Deduplicates by tool_call_id keeping the most recent invocation_timestamp.';
+'Analytics view tracking tool call lifecycles with interaction tracing. Fields: interaction_id (original user query/task ID from A2A framework), context_id, tool_call_id, tool_name, tool_input_args, invocation_timestamp, and tool_output_result. All tool calls from subtasks are mapped to their parent task via A2A parentTaskId metadata. Deduplicates by tool_call_id keeping the most recent invocation_timestamp.';

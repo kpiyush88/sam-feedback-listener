@@ -23,7 +23,6 @@ from solace.messaging.resources.topic_subscription import TopicSubscription
 from solace.messaging.receiver.message_receiver import MessageHandler, InboundMessage
 from solace.messaging.config.transport_security_strategy import TLS
 
-from message_parser import MessageParser
 from supabase_uploader import SupabaseUploader
 
 # Load environment variables from .env file
@@ -320,13 +319,11 @@ class FeedbackMessageHandler(MessageHandler):
 
         # Initialize Supabase uploader if enabled
         self.uploader: Optional[SupabaseUploader] = None
-        self.parser: Optional[MessageParser] = None
 
         if self.enable_supabase:
             try:
                 logger.info("Initializing Supabase uploader...")
                 self.uploader = SupabaseUploader()
-                self.parser = MessageParser()
                 logger.info("Supabase uploader initialized successfully")
                 print("Supabase uploader initialized successfully")
             except Exception as e:
@@ -421,7 +418,7 @@ class FeedbackMessageHandler(MessageHandler):
         )
 
         supabase_future = None
-        if self.enable_supabase and self.uploader and self.parser:
+        if self.enable_supabase and self.uploader:
             supabase_future = self.executor.submit(
                 self._upload_to_supabase,
                 message_obj
@@ -497,48 +494,31 @@ class FeedbackMessageHandler(MessageHandler):
 
         for attempt in range(max_retries):
             try:
-                logger.debug(f"Parsing message #{message_id} (attempt {attempt + 1}/{max_retries})")
-                parsed = self.parser.parse_message(message_obj)
+                logger.debug(f"Uploading message #{message_id} to Supabase (attempt {attempt + 1}/{max_retries})")
+                result = self.uploader.upload_message(message_obj)
 
-                logger.debug(f"Uploading parsed message #{message_id} to Supabase (context_id: {parsed.context_id}, message_id: {parsed.message_id})")
-                result = self.uploader.upload_message(parsed)
-
-                if 'error' in result:
-                    # Extract context_id and message_id from parsed message for better error reporting
-                    context_id = parsed.context_id if parsed and parsed.context_id else 'unknown'
-                    db_message_id = parsed.message_id if parsed and parsed.message_id else 'unknown'
-
+                if result.get('status') == 'error':
                     # Retry on any error if attempts remaining
                     if attempt < max_retries - 1:
-                        logger.warning(f"Upload error on message #{message_id} (attempt {attempt + 1}/{max_retries}): {result['error']}, retrying in {retry_delay}s...")
+                        logger.warning(f"Upload error on message #{message_id} (attempt {attempt + 1}/{max_retries}): {result.get('error')}, retrying in {retry_delay}s...")
                         time.sleep(retry_delay)
                         retry_delay *= 2  # Exponential backoff
                         continue
                     else:
                         # Final attempt failed
-                        logger.error(f"Supabase upload failed for message #{message_id}: {result['error']} (context_id: {context_id[:16] if len(context_id) > 16 else context_id}..., message_id: {db_message_id[:16] if len(db_message_id) > 16 else db_message_id}...)")
+                        logger.error(f"Supabase upload failed for message #{message_id}: {result.get('error')}")
                         self.upload_stats.record_failure()
                         return result
                 else:
                     # Success!
                     if attempt > 0:
-                        logger.info(f"Supabase upload successful for message #{message_id} after {attempt + 1} attempts (DB message_id: {result.get('message_id', 'N/A')}, is_new: {result.get('message_is_new', 'N/A')})")
+                        logger.info(f"Supabase upload successful for message #{message_id} after {attempt + 1} attempts")
                     else:
-                        logger.info(f"Supabase upload successful for message #{message_id} (DB message_id: {result.get('message_id', 'N/A')}, is_new: {result.get('message_is_new', 'N/A')})")
+                        logger.info(f"Supabase upload successful for message #{message_id}")
                     self.upload_stats.record_success()
                     return result
 
             except Exception as e:
-                # Extract context for error logging from parsed message
-                context_id = 'unknown'
-                db_message_id = 'unknown'
-                try:
-                    if 'parsed' in locals():
-                        context_id = parsed.context_id if parsed.context_id else 'unknown'
-                        db_message_id = parsed.message_id if parsed.message_id else 'unknown'
-                except:
-                    pass
-
                 # Retry on any exception if attempts remaining
                 if attempt < max_retries - 1:
                     logger.warning(f"Exception during upload on message #{message_id} (attempt {attempt + 1}/{max_retries}): {e}, retrying in {retry_delay}s...")
@@ -547,14 +527,14 @@ class FeedbackMessageHandler(MessageHandler):
                     continue
                 else:
                     # Final attempt failed
-                    logger.error(f"Exception during Supabase upload for message #{message_id}: {e} (context_id: {context_id[:16] if len(context_id) > 16 else context_id}..., message_id: {db_message_id[:16] if len(db_message_id) > 16 else db_message_id}...)", exc_info=True)
+                    logger.error(f"Exception during Supabase upload for message #{message_id}: {e}", exc_info=True)
                     self.upload_stats.record_failure()
-                    return {'error': str(e)}
+                    return {'status': 'error', 'error': str(e)}
 
         # Should never reach here, but just in case
         logger.error(f"All retry attempts exhausted for message #{message_id}")
         self.upload_stats.record_failure()
-        return {'error': 'All retry attempts exhausted'}
+        return {'status': 'error', 'error': 'All retry attempts exhausted'}
 
     def _print_filtered_message(self, topic: str) -> None:
         """Print filtered message info"""
@@ -591,10 +571,10 @@ class FeedbackMessageHandler(MessageHandler):
                 # Non-blocking check if completed, otherwise show "in progress"
                 if supabase_future.done():
                     result = supabase_future.result()
-                    if 'error' in result:
-                        print(f"⚠️  Supabase upload failed: {result['error']}")
+                    if result.get('status') == 'error':
+                        print(f"⚠️  Supabase upload failed: {result.get('error')}")
                     else:
-                        print(f"✓ Uploaded to Supabase (Conv: {result.get('conversation_id', 'N/A')[:8]}...)")
+                        print(f"✓ Uploaded to Supabase")
                 else:
                     print(f"⏳ Supabase upload in progress...")
             except Exception as e:
