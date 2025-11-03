@@ -101,7 +101,8 @@ combined_tool_data AS (
     AND COALESCE(lfc.source_id, tis.source_id) = tr.source_id
 ),
 
--- Deduplicate by tool_call_id, keeping the record with the most recent invocation_timestamp
+-- Deduplicate by tool_call_id, keeping the record with the EARLIEST invocation_timestamp
+-- (the executor agent, not the delegator agent which echoes the call)
 deduplicated_tool_data AS (
   SELECT DISTINCT ON (tool_call_id)
     source_id,
@@ -114,13 +115,14 @@ deduplicated_tool_data AS (
     result_timestamp
   FROM combined_tool_data
   WHERE tool_call_id IS NOT NULL
-  ORDER BY tool_call_id, invocation_timestamp DESC
+  ORDER BY tool_call_id, invocation_timestamp ASC
 ),
 
 -- Add interaction_id: maps all tool calls to the original user query (main task)
 -- For main tasks (gdk-task-*), use the task ID directly
 -- For subtasks (a2a_subtask_*), look up the parentTaskId from the A2A framework metadata
-with_interaction_id AS (
+-- Also add duration field calculated AFTER deduplication
+with_interaction_id_and_duration AS (
   SELECT
     dtd.*,
     CASE
@@ -137,11 +139,18 @@ with_interaction_id AS (
       )
 
       ELSE NULL
-    END AS interaction_id
+    END AS interaction_id,
+    -- Calculate duration: result_timestamp - invocation_timestamp
+    -- Returns duration in seconds as a numeric value (e.g., 2.5 for 2.5 seconds)
+    CASE
+      WHEN dtd.result_timestamp IS NOT NULL AND dtd.invocation_timestamp IS NOT NULL
+      THEN EXTRACT(EPOCH FROM (dtd.result_timestamp - dtd.invocation_timestamp))
+      ELSE NULL
+    END AS duration
   FROM deduplicated_tool_data dtd
 )
 
--- Final SELECT with requested fields including interaction_id
+-- Final SELECT with requested fields including interaction_id and duration
 SELECT
   interaction_id,
   context_id,
@@ -149,10 +158,11 @@ SELECT
   tool_name,
   tool_input_args,
   invocation_timestamp,
-  tool_output_result
-FROM with_interaction_id
+  tool_output_result,
+  duration
+FROM with_interaction_id_and_duration
 ORDER BY invocation_timestamp DESC;
 
 -- Add comment to the view
 COMMENT ON VIEW tool_interactions_view IS
-'Analytics view tracking tool call lifecycles with interaction tracing. Fields: interaction_id (original user query/task ID from A2A framework), context_id, tool_call_id, tool_name, tool_input_args, invocation_timestamp, and tool_output_result. All tool calls from subtasks are mapped to their parent task via A2A parentTaskId metadata. Deduplicates by tool_call_id keeping the most recent invocation_timestamp.';
+'Analytics view tracking tool call lifecycles with interaction tracing. Fields: interaction_id (original user query/task ID from A2A framework), context_id, tool_call_id, tool_name, tool_input_args, invocation_timestamp, tool_output_result, and duration (numeric seconds between invocation and result). All tool calls from subtasks are mapped to their parent task via A2A parentTaskId metadata. Deduplicates by tool_call_id keeping the EARLIEST invocation_timestamp (executor agent, not delegator echo).';
