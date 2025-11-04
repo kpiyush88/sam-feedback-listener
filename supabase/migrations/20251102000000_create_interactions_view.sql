@@ -35,6 +35,18 @@ final_responses AS (
     AND topic LIKE '%gateway/response%'
     AND raw_payload->'result'->'status'->'message'->'parts'->0->>'text' IS NOT NULL
   ORDER BY raw_payload->>'id', created_at DESC
+),
+
+-- Extract peer agent delegations from tool_interactions_view
+-- This identifies which agent was delegated to handle the interaction
+peer_delegations AS (
+  SELECT
+    tiv.interaction_id,
+    tiv.tool_output_result->'metadata'->>'agent_name' as delegated_agent,
+    ROW_NUMBER() OVER (PARTITION BY tiv.interaction_id ORDER BY tiv.invocation_timestamp) as rn
+  FROM tool_interactions_view tiv
+  WHERE tiv.tool_name LIKE 'peer_%'
+    AND tiv.tool_output_result->'metadata'->>'agent_name' IS NOT NULL
 )
 
 -- Join first messages with final responses and calculate duration
@@ -43,6 +55,15 @@ SELECT
   fm.context_id,
   fm.created_at,
   fm.agent_name,
+  -- Determine the handling agent based on the logic:
+  -- 1. If not orchestrator, use the agent_name (direct handling)
+  -- 2. If orchestrator with peer delegation, use the delegated agent
+  -- 3. If orchestrator without delegation, use OrchestratorAgent
+  CASE
+    WHEN fm.agent_name != 'OrchestratorAgent' THEN fm.agent_name
+    WHEN pd.delegated_agent IS NOT NULL THEN pd.delegated_agent
+    ELSE fm.agent_name
+  END as handling_agent,
   fm.user_query,
   fm.user_profile,
   fr.final_response,
@@ -55,8 +76,9 @@ SELECT
   END AS duration
 FROM first_messages fm
 LEFT JOIN final_responses fr ON fm.interaction_id = fr.interaction_id
+LEFT JOIN peer_delegations pd ON fm.interaction_id = pd.interaction_id AND pd.rn = 1
 ORDER BY fm.created_at DESC;
 
 -- Add comment to the view
 COMMENT ON VIEW interactions_view IS
-'Analytics view tracking user interactions from initial query to final response. Fields: interaction_id (gdk-task ID), context_id, created_at (timestamp of user query), agent_name, user_query, user_profile (user context), final_response (agent''s final answer), and duration (numeric seconds from query to response). Each row represents one complete user interaction.';
+'Analytics view tracking user interactions from initial query to final response. Fields: interaction_id (gdk-task ID), context_id, created_at (timestamp of user query), agent_name (initially invoked agent), handling_agent (agent that actually handled the interaction), user_query, user_profile (user context), final_response (agent''s final answer), and duration (numeric seconds from query to response). The handling_agent differs from agent_name when OrchestratorAgent delegates to peer agents. Each row represents one complete user interaction.';
