@@ -118,6 +118,17 @@ deduplicated_tool_data AS (
   ORDER BY tool_call_id, invocation_timestamp ASC
 ),
 
+-- Extract agent names from source tasks/subtasks
+agent_names AS (
+  SELECT DISTINCT ON (raw_payload->>'id')
+    raw_payload->>'id' AS source_id,
+    raw_payload->'params'->'message'->'metadata'->>'agent_name' AS agent_name
+  FROM messages
+  WHERE (raw_payload->>'id' LIKE 'gdk-task-%' OR raw_payload->>'id' LIKE 'a2a_subtask_%')
+    AND raw_payload->'params'->'message'->'metadata'->>'agent_name' IS NOT NULL
+  ORDER BY raw_payload->>'id', created_at
+),
+
 -- Add interaction_id: maps all tool calls to the original user query (main task)
 -- For main tasks (gdk-task-*), use the task ID directly
 -- For subtasks (a2a_subtask_*), look up the parentTaskId from the A2A framework metadata
@@ -150,19 +161,21 @@ with_interaction_id_and_duration AS (
   FROM deduplicated_tool_data dtd
 )
 
--- Final SELECT with requested fields including interaction_id and duration
+-- Final SELECT with requested fields including interaction_id, duration, and calling_agent
 SELECT
-  interaction_id,
-  context_id,
-  tool_call_id,
-  tool_name,
-  tool_input_args,
-  invocation_timestamp,
-  tool_output_result,
-  duration
-FROM with_interaction_id_and_duration
-ORDER BY invocation_timestamp DESC;
+  wid.interaction_id,
+  wid.context_id,
+  wid.tool_call_id,
+  wid.tool_name,
+  wid.tool_input_args,
+  wid.invocation_timestamp,
+  wid.tool_output_result,
+  wid.duration,
+  an.agent_name AS calling_agent
+FROM with_interaction_id_and_duration wid
+LEFT JOIN agent_names an ON wid.source_id = an.source_id
+ORDER BY wid.invocation_timestamp DESC;
 
 -- Add comment to the view
 COMMENT ON VIEW tool_interactions_view IS
-'Analytics view tracking tool call lifecycles with interaction tracing. Fields: interaction_id (original user query/task ID from A2A framework), context_id, tool_call_id, tool_name, tool_input_args, invocation_timestamp, tool_output_result, and duration (numeric seconds between invocation and result). All tool calls from subtasks are mapped to their parent task via A2A parentTaskId metadata. Deduplicates by tool_call_id keeping the EARLIEST invocation_timestamp (executor agent, not delegator echo).';
+'Analytics view tracking tool call lifecycles with interaction tracing. Fields: interaction_id (original user query/task ID from A2A framework), context_id, tool_call_id, tool_name, tool_input_args, invocation_timestamp, tool_output_result, duration (numeric seconds between invocation and result), and calling_agent (agent that made the tool call). All tool calls from subtasks are mapped to their parent task via A2A parentTaskId metadata. Deduplicates by tool_call_id keeping the EARLIEST invocation_timestamp (executor agent, not delegator echo).';
