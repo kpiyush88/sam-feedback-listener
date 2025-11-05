@@ -13,7 +13,7 @@ first_messages AS (
   SELECT DISTINCT ON (raw_payload->>'id')
     raw_payload->>'id' AS interaction_id,
     created_at,
-    raw_payload->'params'->'message'->>'contextId' AS context_id,
+    raw_payload->'params'->'message'->>'contextId' AS session_id,
     raw_payload->'params'->'message'->'metadata'->>'agent_name' AS agent_name,
     raw_payload->'params'->'message'->'parts'->1->>'text' AS user_query,
     user_context_raw AS user_profile
@@ -52,7 +52,7 @@ peer_delegations AS (
 -- Join first messages with final responses and calculate duration
 SELECT
   fm.interaction_id,
-  fm.context_id,
+  fm.session_id,
   fm.created_at,
   fm.agent_name,
   -- Determine the handling agent based on the logic:
@@ -81,4 +81,4 @@ ORDER BY fm.created_at DESC;
 
 -- Add comment to the view
 COMMENT ON VIEW interactions_view IS
-'Analytics view tracking user interactions from initial query to final response. Fields: interaction_id (gdk-task ID), context_id, created_at (timestamp of user query), agent_name (initially invoked agent), handling_agent (agent that actually handled the interaction), user_query, user_profile (user context), final_response (agent''s final answer), and duration (numeric seconds from query to response). The handling_agent differs from agent_name when OrchestratorAgent delegates to peer agents. Each row represents one complete user interaction.';
+'Analytics view tracking user interactions from initial query to final response. Fields: interaction_id (gdk-task ID), session_id, created_at (timestamp of user query), agent_name (initially invoked agent), handling_agent (agent that actually handled the interaction), user_query, user_profile (user context), final_response (agent''s final answer), and duration (numeric seconds from query to response). The handling_agent differs from agent_name when OrchestratorAgent delegates to peer agents. Each row represents one complete user interaction.';

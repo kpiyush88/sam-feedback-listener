@@ -15,7 +15,7 @@ all_messages AS (
     COALESCE(
       (raw_payload->'params'->'message'->>'contextId'),
       (raw_payload->'result'->>'contextId')
-    ) AS context_id,
+    ) AS session_id,
     created_at AS message_timestamp,
     jsonb_array_elements(
       COALESCE(
@@ -36,14 +36,14 @@ all_messages AS (
 llm_function_calls AS (
   SELECT
     source_id,
-    context_id,
+    session_id,
     func_call.value->>'id' AS tool_call_id,
     func_call.value->>'name' AS tool_name,
     func_call.value->'args' AS tool_input_args
   FROM (
     SELECT
       source_id,
-      context_id,
+      session_id,
       jsonb_array_elements((part->'data'->'request'->'contents'))->>'role' AS role,
       jsonb_array_elements(jsonb_array_elements((part->'data'->'request'->'contents')->'parts')) AS model_part
     FROM all_messages
@@ -62,7 +62,7 @@ llm_function_calls AS (
 tool_invocation_start AS (
   SELECT
     source_id,
-    context_id,
+    session_id,
     message_timestamp AS invocation_timestamp,
     (part->'data'->>'function_call_id') AS tool_call_id,
     (part->'data'->>'tool_name') AS tool_name,
@@ -86,7 +86,7 @@ tool_results AS (
 combined_tool_data AS (
   SELECT
     COALESCE(lfc.source_id, tis.source_id, tr.source_id) AS source_id,
-    COALESCE(tis.context_id, lfc.context_id) AS context_id,
+    COALESCE(tis.session_id, lfc.session_id) AS session_id,
     COALESCE(lfc.tool_call_id, tis.tool_call_id, tr.tool_call_id) AS tool_call_id,
     COALESCE(tis.tool_name, lfc.tool_name) AS tool_name,
     COALESCE(tis.tool_input_args, lfc.tool_input_args) AS tool_input_args,
@@ -106,7 +106,7 @@ combined_tool_data AS (
 deduplicated_tool_data AS (
   SELECT DISTINCT ON (tool_call_id)
     source_id,
-    context_id,
+    session_id,
     tool_call_id,
     tool_name,
     tool_input_args,
@@ -164,7 +164,7 @@ with_interaction_id_and_duration AS (
 -- Final SELECT with requested fields including interaction_id, duration, and calling_agent
 SELECT
   wid.interaction_id,
-  wid.context_id,
+  wid.session_id,
   wid.tool_call_id,
   wid.tool_name,
   wid.tool_input_args,
@@ -178,4 +178,4 @@ ORDER BY wid.invocation_timestamp DESC;
 
 -- Add comment to the view
 COMMENT ON VIEW tool_interactions_view IS
-'Analytics view tracking tool call lifecycles with interaction tracing. Fields: interaction_id (original user query/task ID from A2A framework), context_id, tool_call_id, tool_name, tool_input_args, invocation_timestamp, tool_output_result, duration (numeric seconds between invocation and result), and calling_agent (agent that made the tool call). All tool calls from subtasks are mapped to their parent task via A2A parentTaskId metadata. Deduplicates by tool_call_id keeping the EARLIEST invocation_timestamp (executor agent, not delegator echo).';
+'Analytics view tracking tool call lifecycles with interaction tracing. Fields: interaction_id (original user query/task ID from A2A framework), session_id, tool_call_id, tool_name, tool_input_args, invocation_timestamp, tool_output_result, duration (numeric seconds between invocation and result), and calling_agent (agent that made the tool call). All tool calls from subtasks are mapped to their parent task via A2A parentTaskId metadata. Deduplicates by tool_call_id keeping the EARLIEST invocation_timestamp (executor agent, not delegator echo).';
